@@ -98,7 +98,7 @@ impl<F: Field> ExecutionGadget<F> for ReturnDataCopyGadget<F> {
         );
 
         // 4 memory copy
-        // Construct memory address in the destionation (memory) to which we copy code.
+        // Construct memory address in the destination (memory) to which we copy code.
         let dst_memory_addr = MemoryAddressGadget::construct(cb, dest_offset, size);
 
         // Calculate the next memory size and the gas cost for this memory
