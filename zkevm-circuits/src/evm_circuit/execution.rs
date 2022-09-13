@@ -78,7 +78,7 @@ mod sstore;
 mod stop;
 mod swap;
 
-use self::{returndatacopy::ReturnDataCopyGadget, sha3::Sha3Gadget};
+use self::sha3::Sha3Gadget;
 use add_sub::AddSubGadget;
 use addmod::AddModGadget;
 use address::AddressGadget;
@@ -120,6 +120,7 @@ use pc::PcGadget;
 use pop::PopGadget;
 use push::PushGadget;
 use r#return::ReturnGadget;
+use returndatacopy::ReturnDataCopyGadget;
 use returndatasize::ReturnDataSizeGadget;
 use sdiv_smod::SignedDivModGadget;
 use selfbalance::SelfbalanceGadget;
