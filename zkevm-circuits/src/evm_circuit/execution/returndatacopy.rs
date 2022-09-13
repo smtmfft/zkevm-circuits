@@ -10,7 +10,7 @@ use crate::{
                 Transition::{Delta, To},
             },
             from_bytes,
-            math_gadget::LtGadget,
+            math_gadget::RangeCheckGadget,
             memory_gadget::{MemoryAddressGadget, MemoryCopierGasGadget, MemoryExpansionGadget},
             CachedRegion, Cell, MemoryAddress,
         },
@@ -47,7 +47,7 @@ pub(crate) struct ReturnDataCopyGadget<F> {
     /// steps.
     copy_rwc_inc: Cell<F>,
     /// Out of bound check circuit.
-    in_bound_check: LtGadget<F, N_BYTES_MEMORY_WORD_SIZE>,
+    in_bound_check: RangeCheckGadget<F, N_BYTES_MEMORY_WORD_SIZE>,
 }
 
 impl<F: Field> ExecutionGadget<F> for ReturnDataCopyGadget<F> {
@@ -86,15 +86,10 @@ impl<F: Field> ExecutionGadget<F> for ReturnDataCopyGadget<F> {
 
         // 3. contraints for copy: copy overflow check
         // i.e., offset + size <= return_data_size
-        let in_bound_check = LtGadget::construct(
+        let in_bound_check = RangeCheckGadget::construct(
             cb,
-            from_bytes::expr(&data_offset.cells) + from_bytes::expr(&size.cells),
-            return_data_size.expr() + 1.expr(),
-        );
-        cb.require_equal(
-            "offset + size < return_data_size + 1",
-            in_bound_check.expr(),
-            1.expr(),
+            return_data_size.expr()
+                - (from_bytes::expr(&data_offset.cells) + from_bytes::expr(&size.cells)),
         );
 
         // 4 memory copy
@@ -236,14 +231,11 @@ impl<F: Field> ExecutionGadget<F> for ReturnDataCopyGadget<F> {
             ),
         )?;
 
-        let copy_end_offset = data_offset + size;
+        let bytes_to_copy = return_data_size - (data_offset + size);
         self.in_bound_check.assign(
             region,
             offset,
-            copy_end_offset
-                .to_scalar()
-                .expect("unexpected U256 -> Scalar conversion failure"),
-            (return_data_size + 1)
+            bytes_to_copy
                 .to_scalar()
                 .expect("unexpected U256 -> Scalar conversion failure"),
         )?;
@@ -345,11 +337,11 @@ mod test {
 
     // TODO: revert is normal, no need to panic. maybe we need a padding trace log
     // to test this.
-    // #[test]
+    #[test]
     // #[should_panic]
-    // fn returndatacopy_gadget_out_of_bound() {
-    //     test_ok_internal(0x00, 0x10, 0x20, 0x10, 0x10);
-    // }
+    fn returndatacopy_gadget_out_of_bound() {
+        test_ok_internal(0x00, 0x10, 0x20, 0x10, 0x10);
+    }
 
     #[test]
     #[should_panic]
