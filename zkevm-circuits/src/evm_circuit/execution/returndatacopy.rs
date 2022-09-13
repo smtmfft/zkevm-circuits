@@ -88,7 +88,7 @@ impl<F: Field> ExecutionGadget<F> for ReturnDataCopyGadget<F> {
         // i.e., offset + size <= return_data_size
         let in_bound_check = LtGadget::construct(
             cb,
-            from_bytes::expr(&data_offset.cells) + size.expr(),
+            from_bytes::expr(&data_offset.cells) + from_bytes::expr(&size.cells),
             return_data_size.expr() + 1.expr(),
         );
         cb.require_equal(
