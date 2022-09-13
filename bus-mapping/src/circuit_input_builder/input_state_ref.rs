@@ -830,13 +830,10 @@ impl<'a> CircuitInputStateRef<'a> {
 
         // If current call has caller.
         // TODO: use is_root??
-        match self.caller_mut() {
-            Ok(caller) => {
-                caller.last_callee_id = call.call_id;
-                caller.last_callee_return_data_length = call.return_data_length;
-                caller.last_callee_return_data_offset = call.return_data_offset;
-            }
-            Err(_) => {}
+        if let Ok(caller) = self.caller_mut() {
+            caller.last_callee_id = call.call_id;
+            caller.last_callee_return_data_length = call.return_data_length;
+            caller.last_callee_return_data_offset = call.return_data_offset;
         }
 
         self.tx_ctx.pop_call_ctx();
