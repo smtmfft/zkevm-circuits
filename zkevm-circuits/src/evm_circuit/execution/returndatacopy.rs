@@ -28,9 +28,9 @@ use halo2_proofs::{circuit::Value, plonk::Error};
 pub(crate) struct ReturnDataCopyGadget<F> {
     same_context: SameContextGadget<F>,
     /// Holds the memory address for return data from where we read.
-    return_data_offset: Cell<F>, //MemoryAddress<F>,
+    return_data_offset: Cell<F>,
     /// Holds the size of the return data.
-    return_data_size: Cell<F>, //RandomLinearCombination<F, N_BYTES_MEMORY_ADDRESS>,
+    return_data_size: Cell<F>,
     /// The data is copied to memory. To verify this
     /// copy operation we need the MemoryAddressGadget.
     dst_memory_addr: MemoryAddressGadget<F>,
@@ -261,9 +261,10 @@ mod test {
         let (addr_a, addr_b) = (mock::MOCK_ACCOUNTS[0], mock::MOCK_ACCOUNTS[1]);
 
         let pushdata = rand_bytes(32);
+        let return_offset = std::cmp::max(return_data_size as i64 - 32, 0) as usize;
         let code_b = bytecode! {
             PUSH32(Word::from_big_endian(&pushdata))
-            PUSH1(0)
+            PUSH32(return_offset)
             MSTORE
 
             PUSH32(return_data_size)
@@ -276,7 +277,7 @@ mod test {
         let code_a = bytecode! {
             // call ADDR_B.
             PUSH32(return_data_size) // retLength
-            PUSH1(return_data_offset) // retOffset
+            PUSH32(return_data_offset) // retOffset
             PUSH1(0x00) // argsLength
             PUSH1(0x00) // argsOffset
             PUSH1(0x00) // value
@@ -284,9 +285,9 @@ mod test {
             PUSH32(0x1_0000) // gas
             CALL
             RETURNDATASIZE
-            PUSH1(size) // size
-            PUSH1(offset) // offset
-            PUSH1(dest_offset) // dest_offset
+            PUSH32(size) // size
+            PUSH32(offset) // offset
+            PUSH32(dest_offset) // dest_offset
             RETURNDATACOPY
             STOP
         };
@@ -335,6 +336,12 @@ mod test {
         test_ok_internal(0x00, 0x00, 0x20, 0x00, 0x00);
     }
 
+    #[test]
+    fn returndatacopy_gadget_long_length() {
+        // rlc value matters only if length > 255, i.e., size.cells.len() > 1
+        test_ok_internal(0x00, 0x200, 0x20, 0x00, 0x150);
+    }
+
     // TODO: revert is normal, no need to panic. maybe we need a padding trace log
     // to test this.
     #[test]
@@ -346,6 +353,6 @@ mod test {
     #[test]
     #[should_panic]
     fn returndatacopy_gadget_out_of_gas() {
-        test_ok_internal(0x00, 0x10, 0x20000, 0x10, 0x10);
+        test_ok_internal(0x00, 0x10, 0x20000, 0x00, 0x10);
     }
 }
