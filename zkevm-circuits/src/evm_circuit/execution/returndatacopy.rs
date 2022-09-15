@@ -261,14 +261,15 @@ mod test {
         let (addr_a, addr_b) = (mock::MOCK_ACCOUNTS[0], mock::MOCK_ACCOUNTS[1]);
 
         let pushdata = rand_bytes(32);
-        let return_offset = std::cmp::max(return_data_size as i64 - 32, 0) as usize;
+        let return_offset =
+            std::cmp::max((return_data_offset + return_data_size) as i64 - 32, 0) as usize;
         let code_b = bytecode! {
             PUSH32(Word::from_big_endian(&pushdata))
             PUSH32(return_offset)
             MSTORE
 
             PUSH32(return_data_size)
-            PUSH1(return_data_offset)
+            PUSH32(return_data_offset)
             RETURN
             STOP
         };
@@ -340,6 +341,12 @@ mod test {
     fn returndatacopy_gadget_long_length() {
         // rlc value matters only if length > 255, i.e., size.cells.len() > 1
         test_ok_internal(0x00, 0x200, 0x20, 0x00, 0x150);
+    }
+
+    #[test]
+    fn returndatacopy_gadget_big_offset() {
+        // rlc value matters only if length > 255, i.e., size.cells.len() > 1
+        test_ok_internal(0x200, 0x200, 0x200, 0x00, 0x150);
     }
 
     // TODO: Add negative cases for out-of-bound and out-of-gas
