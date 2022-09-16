@@ -104,8 +104,7 @@ fn gen_copy_steps(
             );
             (byte, false)
         } else {
-            //TODO: return out of bound
-            unreachable!("copy out of bound")
+            unreachable!("return data copy out of bound")
         };
         let tag = CopyDataType::Memory;
         // Read
