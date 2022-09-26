@@ -3,10 +3,7 @@
 #[cfg(test)]
 mod tests {
     use ark_std::{end_timer, start_timer};
-    use eth_types::geth_types::Transaction;
     use eth_types::Word;
-    use ethers_core::types::{NameOrAddress, TransactionRequest};
-    use ethers_signers::{LocalWallet, Signer};
     use halo2_proofs::arithmetic::Field;
     use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof};
     use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG, ParamsVerifierKZG};
@@ -19,20 +16,21 @@ mod tests {
             Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
         },
     };
-    use rand::{CryptoRng, Rng, SeedableRng};
+    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
     use rand_xorshift::XorShiftRng;
     use std::env::var;
     use zkevm_circuits::pi_circuit::{
         raw_public_inputs_col, PiCircuit, PublicData, BLOCK_LEN, EXTRA_LEN, TX_LEN,
     };
+    use zkevm_circuits::test_util::rand_tx;
     use zkevm_circuits::util::random_linear_combine_word as rlc;
 
     #[cfg_attr(not(feature = "benches"), ignore)]
     #[test]
     fn bench_pi_circuit_prover() {
         let degree: u32 = var("DEGREE")
-            .unwrap_or("18".to_string())
+            .unwrap_or("15".to_string())
             .parse()
             .expect("Cannot parse DEGREE env var as u32");
 
@@ -150,41 +148,5 @@ mod tests {
         }
 
         public_data
-    }
-
-    /// generate rand tx for pi circuit
-    fn rand_tx<R: Rng + CryptoRng>(mut rng: R, chain_id: u64) -> Transaction {
-        let wallet0 = LocalWallet::new(&mut rng).with_chain_id(chain_id);
-        let wallet1 = LocalWallet::new(&mut rng).with_chain_id(chain_id);
-        let from = wallet0.address();
-        let to = wallet1.address();
-        let data = b"hello";
-        let tx = TransactionRequest::new()
-            .chain_id(chain_id)
-            .from(from)
-            .to(to)
-            .nonce(3)
-            .value(1000)
-            .data(data)
-            .gas(500_000)
-            .gas_price(1234);
-        let sig = wallet0.sign_transaction_sync(&tx.clone().into());
-        let to = tx.to.map(|to| match to {
-            NameOrAddress::Address(a) => a,
-            _ => unreachable!(),
-        });
-        Transaction {
-            from: tx.from.unwrap(),
-            to,
-            gas_limit: tx.gas.unwrap(),
-            gas_price: tx.gas_price.unwrap(),
-            value: tx.value.unwrap(),
-            call_data: tx.data.unwrap(),
-            nonce: tx.nonce.unwrap(),
-            v: sig.v,
-            r: sig.r,
-            s: sig.s,
-            ..Transaction::default()
-        }
     }
 }
