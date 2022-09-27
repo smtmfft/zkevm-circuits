@@ -15,9 +15,9 @@ fmt: ## Check whether the code is formated correctly
 	@cargo fmt --all -- --check
 
 test: ## Run tests for all the workspace members
-	# Run light tests
+        # Run light tests
 	@cargo test --release --all --all-features --exclude integration-tests --exclude circuit-benchmarks
-	# Run heavy tests serially to avoid OOM
+        # Run heavy tests serially to avoid OOM
 	@cargo test --release --all --all-features --exclude integration-tests --exclude circuit-benchmarks serial_ -- --ignored --test-threads 1
 
 test_doc: ## Test the docs
@@ -48,6 +48,9 @@ packed_multi_keccak_bench: ## Run Packed Multi Keccak Circuit benchmarks
 
 bytecode_bench: ## Run Bytecode Circuit benchmarks
 	@cargo test --profile bench bench_bytecode_circuit_prover -p circuit-benchmarks --features benches  -- --nocapture
+
+pi_bench: ## Run Public Input Circuit benchmarks
+	@cargo test --profile bench bench_pi_circuit_prover -p circuit-benchmarks --features benches  -- --nocapture
 
 circuit_benches: evm_bench state_bench ## Run All Circuit benchmarks
 
