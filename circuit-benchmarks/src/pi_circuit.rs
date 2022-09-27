@@ -1,10 +1,8 @@
 //! State circuit benchmarks
-
 #[cfg(test)]
 mod tests {
     use ark_std::{end_timer, start_timer};
     use eth_types::Word;
-    use halo2_proofs::arithmetic::Field;
     use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof};
     use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG, ParamsVerifierKZG};
     use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
@@ -20,11 +18,8 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
     use rand_xorshift::XorShiftRng;
     use std::env::var;
-    use zkevm_circuits::pi_circuit::{
-        raw_public_inputs_col, PiCircuit, PublicData, BLOCK_LEN, EXTRA_LEN, TX_LEN,
-    };
+    use zkevm_circuits::pi_circuit::{PiCircuit, PublicData};
     use zkevm_circuits::test_util::rand_tx;
-    use zkevm_circuits::util::random_linear_combine_word as rlc;
 
     #[cfg_attr(not(feature = "benches"), ignore)]
     #[test]
@@ -35,48 +30,16 @@ mod tests {
             .expect("Cannot parse DEGREE env var as u32");
 
         const MAX_TXS: usize = 10;
-
         const MAX_CALLDATA: usize = 128;
 
-        // Initialize the polynomial commitment parameters
+        let public_data = fillup_publicdata::<MAX_TXS, MAX_CALLDATA>();
+        let circuit = PiCircuit::<Fr, MAX_TXS, MAX_CALLDATA>::new(public_data);
+        let public_inputs = circuit.public_inputs();
+
         let mut rng = XorShiftRng::from_seed([
             0x59, 0x62, 0xbe, 0x5d, 0x76, 0x3d, 0x31, 0x8d, 0x17, 0xdb, 0x37, 0x32, 0x54, 0x06,
             0xbc, 0xe5,
         ]);
-
-        // Create the circuit
-        let randomness = <Fr as Field>::random(&mut rng);
-        let public_data = fillup_publicdata::<MAX_TXS, MAX_CALLDATA>();
-
-        let rlc_rpi_col =
-            raw_public_inputs_col::<Fr, MAX_TXS, MAX_CALLDATA>(&public_data, randomness);
-        assert_eq!(
-            rlc_rpi_col.len(),
-            BLOCK_LEN + 1 + EXTRA_LEN + 3 * (TX_LEN * MAX_TXS + 1 + MAX_CALLDATA)
-        );
-
-        // Computation of raw_pulic_inputs
-        let rlc_rpi = rlc_rpi_col
-            .iter()
-            .rev()
-            .fold(Fr::zero(), |acc, val| acc * randomness + val);
-
-        let public_inputs = vec![
-            randomness,
-            rlc_rpi,
-            Fr::from(public_data.extra.chain_id.as_u64()),
-            rlc(
-                public_data.extra.eth_block.state_root.to_fixed_bytes(),
-                randomness,
-            ),
-            rlc(public_data.prev_state_root.to_fixed_bytes(), randomness),
-        ];
-
-        let circuit = PiCircuit::<Fr, MAX_TXS, MAX_CALLDATA> {
-            randomness: randomness,
-            rand_rpi: randomness.clone(),
-            public_data: public_data,
-        };
 
         // Bench setup generation
         let setup_message = format!("Setup generation with degree = {}", degree);

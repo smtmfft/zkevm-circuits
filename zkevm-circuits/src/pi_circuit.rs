@@ -21,6 +21,8 @@ use halo2_proofs::{
     plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Selector},
     poly::Rotation,
 };
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 /// Fixed by the spec
 const TX_LEN: usize = 9;
@@ -837,118 +839,165 @@ impl<F: Field, const MAX_TXS: usize, const MAX_CALLDATA: usize> Circuit<F>
     }
 }
 
-#[cfg(any(feature = "test", test))]
-/// Compute the raw_public_inputs column from the verifier's perspective.
-pub fn raw_public_inputs_col<F: Field, const MAX_TXS: usize, const MAX_CALLDATA: usize>(
-    public_data: &PublicData,
-    randomness: F, // For RLC encoding
-) -> Vec<F> {
-    let block = public_data.get_block_table_values();
-    let extra = public_data.get_extra_values();
-    let txs = public_data.get_tx_table_values();
+impl<F: Field, const MAX_TXS: usize, const MAX_CALLDATA: usize>
+    PiCircuit<F, MAX_TXS, MAX_CALLDATA>
+{
+    /// new PiCircuit
+    pub fn new(public_data: PublicData) -> Self {
+        let mut rng = ChaCha20Rng::seed_from_u64(2);
+        let randomness = F::random(&mut rng);
+        let rand_rpi = F::random(&mut rng);
 
-    let mut offset = 0;
-    let mut result =
-        vec![F::zero(); BLOCK_LEN + 1 + EXTRA_LEN + 3 * (TX_LEN * MAX_TXS + 1 + MAX_CALLDATA)];
+        PiCircuit::<F, MAX_TXS, MAX_CALLDATA> {
+            randomness,
+            rand_rpi,
+            public_data,
+        }
+    }
 
-    //  Insert Block Values
-    // zero row
-    result[offset] = F::zero();
-    offset += 1;
-    // coinbase
-    let mut coinbase_bytes = [0u8; 32];
-    coinbase_bytes[12..].clone_from_slice(block.coinbase.as_bytes());
-    result[offset] = rlc(coinbase_bytes, randomness);
-    offset += 1;
-    // gas_limit
-    result[offset] = F::from(block.gas_limit);
-    offset += 1;
-    // number
-    result[offset] = F::from(block.number);
-    offset += 1;
-    // timestamp
-    result[offset] = F::from(block.timestamp);
-    offset += 1;
-    // difficulty
-    result[offset] = rlc(block.difficulty.to_le_bytes(), randomness);
-    offset += 1;
-    // base_fee
-    result[offset] = rlc(block.base_fee.to_le_bytes(), randomness);
-    offset += 1;
-    // chain_id
-    result[offset] = F::from(block.chain_id);
-    offset += 1;
-    // Previous block hashes
-    for prev_hash in block.history_hashes {
-        result[offset] = rlc(prev_hash.to_fixed_bytes(), randomness);
+    /// return the instances
+    pub fn public_inputs(&self) -> Vec<F> {
+        let randomness = self.randomness;
+        let rand_rpi = self.rand_rpi;
+        let public_data = &self.public_data;
+
+        let rlc_rpi_col = Self::raw_public_inputs_col(public_data, randomness);
+        assert_eq!(
+            rlc_rpi_col.len(),
+            BLOCK_LEN + 1 + EXTRA_LEN + 3 * (TX_LEN * MAX_TXS + 1 + MAX_CALLDATA)
+        );
+
+        // Computation of raw_pulic_inputs
+        let rlc_rpi = rlc_rpi_col
+            .iter()
+            .rev()
+            .fold(F::zero(), |acc, val| acc * rand_rpi + val);
+
+        let public_inputs = vec![
+            rand_rpi,
+            rlc_rpi,
+            F::from(public_data.extra.chain_id.as_u64()),
+            rlc(
+                public_data.extra.eth_block.state_root.to_fixed_bytes(),
+                randomness,
+            ),
+            rlc(public_data.prev_state_root.to_fixed_bytes(), randomness),
+        ];
+        public_inputs
+    }
+
+    /// Compute the raw_public_inputs column from the verifier's perspective.
+    fn raw_public_inputs_col(
+        public_data: &PublicData,
+        randomness: F, // For RLC encoding
+    ) -> Vec<F> {
+        let block = public_data.get_block_table_values();
+        let extra = public_data.get_extra_values();
+        let txs = public_data.get_tx_table_values();
+
+        let mut offset = 0;
+        let mut result =
+            vec![F::zero(); BLOCK_LEN + 1 + EXTRA_LEN + 3 * (TX_LEN * MAX_TXS + 1 + MAX_CALLDATA)];
+
+        //  Insert Block Values
+        // zero row
+        result[offset] = F::zero();
         offset += 1;
-    }
-
-    // Insert Extra Values
-    // block Root
-    result[BLOCK_LEN] = rlc(extra.state_root.to_fixed_bytes(), randomness);
-    // parent block hash
-    result[BLOCK_LEN + 1] = rlc(extra.prev_state_root.to_fixed_bytes(), randomness);
-
-    // Insert Tx table
-    offset = 0;
-    assert!(txs.len() <= MAX_TXS);
-    let tx_default = TxValues::default();
-
-    let tx_table_len = TX_LEN * MAX_TXS + 1 + MAX_CALLDATA;
-
-    let id_offset = BLOCK_LEN + 1 + EXTRA_LEN;
-    let index_offset = id_offset + tx_table_len;
-    let value_offset = index_offset + tx_table_len;
-
-    // Insert zero row
-    result[id_offset + offset] = F::zero();
-    result[index_offset + offset] = F::zero();
-    result[value_offset + offset] = F::zero();
-
-    offset += 1;
-
-    for i in 0..MAX_TXS {
-        let tx = if i < txs.len() { &txs[i] } else { &tx_default };
-
-        for val in &[
-            rlc(tx.nonce.to_le_bytes(), randomness),
-            rlc(tx.gas.to_le_bytes(), randomness),
-            rlc(tx.gas_price.to_le_bytes(), randomness),
-            tx.from_addr.to_scalar().expect("tx.from too big"),
-            tx.to_addr.to_scalar().expect("tx.to too big"),
-            F::from(tx.is_create),
-            rlc(tx.value.to_le_bytes(), randomness),
-            F::from(tx.call_data_len),
-            rlc(tx.tx_sign_hash, randomness),
-        ] {
-            result[id_offset + offset] = F::from((i + 1) as u64);
-            result[index_offset + offset] = F::zero();
-            result[value_offset + offset] = *val;
-
+        // coinbase
+        let mut coinbase_bytes = [0u8; 32];
+        coinbase_bytes[12..].clone_from_slice(block.coinbase.as_bytes());
+        result[offset] = rlc(coinbase_bytes, randomness);
+        offset += 1;
+        // gas_limit
+        result[offset] = F::from(block.gas_limit);
+        offset += 1;
+        // number
+        result[offset] = F::from(block.number);
+        offset += 1;
+        // timestamp
+        result[offset] = F::from(block.timestamp);
+        offset += 1;
+        // difficulty
+        result[offset] = rlc(block.difficulty.to_le_bytes(), randomness);
+        offset += 1;
+        // base_fee
+        result[offset] = rlc(block.base_fee.to_le_bytes(), randomness);
+        offset += 1;
+        // chain_id
+        result[offset] = F::from(block.chain_id);
+        offset += 1;
+        // Previous block hashes
+        for prev_hash in block.history_hashes {
+            result[offset] = rlc(prev_hash.to_fixed_bytes(), randomness);
             offset += 1;
         }
-    }
-    // Tx Table CallData
-    let mut calldata_count = 0;
-    for (i, tx) in public_data.txs.iter().enumerate() {
-        for (index, byte) in tx.call_data.0.iter().enumerate() {
-            assert!(calldata_count < MAX_CALLDATA);
-            result[id_offset + offset] = F::from((i + 1) as u64);
-            result[index_offset + offset] = F::from(index as u64);
-            result[value_offset + offset] = F::from(*byte as u64);
-            offset += 1;
-            calldata_count += 1;
-        }
-    }
-    for _ in calldata_count..MAX_CALLDATA {
+
+        // Insert Extra Values
+        // block Root
+        result[BLOCK_LEN] = rlc(extra.state_root.to_fixed_bytes(), randomness);
+        // parent block hash
+        result[BLOCK_LEN + 1] = rlc(extra.prev_state_root.to_fixed_bytes(), randomness);
+
+        // Insert Tx table
+        offset = 0;
+        assert!(txs.len() <= MAX_TXS);
+        let tx_default = TxValues::default();
+
+        let tx_table_len = TX_LEN * MAX_TXS + 1 + MAX_CALLDATA;
+
+        let id_offset = BLOCK_LEN + 1 + EXTRA_LEN;
+        let index_offset = id_offset + tx_table_len;
+        let value_offset = index_offset + tx_table_len;
+
+        // Insert zero row
         result[id_offset + offset] = F::zero();
         result[index_offset + offset] = F::zero();
         result[value_offset + offset] = F::zero();
-        offset += 1;
-    }
 
-    result
+        offset += 1;
+
+        for i in 0..MAX_TXS {
+            let tx = if i < txs.len() { &txs[i] } else { &tx_default };
+
+            for val in &[
+                rlc(tx.nonce.to_le_bytes(), randomness),
+                rlc(tx.gas.to_le_bytes(), randomness),
+                rlc(tx.gas_price.to_le_bytes(), randomness),
+                tx.from_addr.to_scalar().expect("tx.from too big"),
+                tx.to_addr.to_scalar().expect("tx.to too big"),
+                F::from(tx.is_create),
+                rlc(tx.value.to_le_bytes(), randomness),
+                F::from(tx.call_data_len),
+                rlc(tx.tx_sign_hash, randomness),
+            ] {
+                result[id_offset + offset] = F::from((i + 1) as u64);
+                result[index_offset + offset] = F::zero();
+                result[value_offset + offset] = *val;
+
+                offset += 1;
+            }
+        }
+        // Tx Table CallData
+        let mut calldata_count = 0;
+        for (i, tx) in public_data.txs.iter().enumerate() {
+            for (index, byte) in tx.call_data.0.iter().enumerate() {
+                assert!(calldata_count < MAX_CALLDATA);
+                result[id_offset + offset] = F::from((i + 1) as u64);
+                result[index_offset + offset] = F::from(index as u64);
+                result[value_offset + offset] = F::from(*byte as u64);
+                offset += 1;
+                calldata_count += 1;
+            }
+        }
+        for _ in calldata_count..MAX_CALLDATA {
+            result[id_offset + offset] = F::zero();
+            result[index_offset + offset] = F::zero();
+            result[value_offset + offset] = F::zero();
+            offset += 1;
+        }
+
+        result
+    }
 }
 
 #[cfg(test)]
@@ -961,55 +1010,14 @@ mod pi_circuit_test {
         halo2curves::bn256::Fr,
     };
     use pretty_assertions::assert_eq;
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha20Rng;
 
     fn run<F: Field, const MAX_TXS: usize, const MAX_CALLDATA: usize>(
         k: u32,
         public_data: PublicData,
     ) -> Result<(), Vec<VerifyFailure>> {
-        let mut rng = ChaCha20Rng::seed_from_u64(2);
-        let randomness = F::random(&mut rng);
+        let circuit = PiCircuit::<F, MAX_TXS, MAX_CALLDATA>::new(public_data);
 
-        let rand_rpi = F::random(&mut rng);
-        let rlc_rpi_col =
-            raw_public_inputs_col::<F, MAX_TXS, MAX_CALLDATA>(&public_data, randomness);
-        assert_eq!(
-            rlc_rpi_col.len(),
-            BLOCK_LEN + 1 + EXTRA_LEN + 3 * (TX_LEN * MAX_TXS + 1 + MAX_CALLDATA)
-        );
-
-        // Computation of raw_pulic_inputs
-        let rlc_rpi = rlc_rpi_col
-            .iter()
-            .rev()
-            .fold(F::zero(), |acc, val| acc * rand_rpi + val);
-
-        // let block_hash = public_data
-        //     .extra
-        //     .eth_block
-        //     .hash
-        //     .unwrap_or_else(H256::zero)
-        //     .to_fixed_bytes();
-
-        let public_inputs = vec![
-            rand_rpi,
-            rlc_rpi,
-            F::from(public_data.extra.chain_id.as_u64()),
-            rlc(
-                public_data.extra.eth_block.state_root.to_fixed_bytes(),
-                randomness,
-            ),
-            rlc(public_data.prev_state_root.to_fixed_bytes(), randomness),
-        ];
-
-        let circuit = PiCircuit::<F, MAX_TXS, MAX_CALLDATA> {
-            randomness,
-            rand_rpi,
-            public_data,
-        };
-
-        let prover = match MockProver::run(k, &circuit, vec![public_inputs]) {
+        let prover = match MockProver::run(k, &circuit, vec![circuit.public_inputs()]) {
             Ok(prover) => prover,
             Err(e) => panic!("{:#?}", e),
         };
