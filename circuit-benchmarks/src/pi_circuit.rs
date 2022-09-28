@@ -32,7 +32,7 @@ mod tests {
         const MAX_TXS: usize = 10;
         const MAX_CALLDATA: usize = 128;
 
-        let public_data = fillup_publicdata::<MAX_TXS, MAX_CALLDATA>();
+        let public_data = generate_publicdata::<MAX_TXS, MAX_CALLDATA>();
         let circuit = PiCircuit::<Fr, MAX_TXS, MAX_CALLDATA>::new(public_data);
         let public_inputs = circuit.public_inputs();
 
@@ -98,9 +98,8 @@ mod tests {
         end_timer!(start3);
     }
 
-    fn fillup_publicdata<const MAX_TXS: usize, const MAX_CALLDATA: usize>() -> PublicData {
+    fn generate_publicdata<const MAX_TXS: usize, const MAX_CALLDATA: usize>() -> PublicData {
         let mut rng = ChaCha20Rng::seed_from_u64(2);
-
         let mut public_data = PublicData::default();
         let chain_id = 1337u64;
         public_data.extra.chain_id = Word::from(chain_id);
@@ -109,7 +108,6 @@ mod tests {
         for _ in 0..n_tx {
             public_data.txs.push(rand_tx(&mut rng, chain_id));
         }
-
         public_data
     }
 }
