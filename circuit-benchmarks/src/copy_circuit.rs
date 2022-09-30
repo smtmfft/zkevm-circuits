@@ -104,21 +104,24 @@ mod tests {
         end_timer!(start3);
     }
 
-    /// generate copy event for copy circuit
+    /// generate enough copy event to fillup copy circuit
     fn generate_block(copy_event_num: usize) -> Block<Fr> {
         let calldata = vec![0, 1, 2, 3];
         let mut code = bytecode! {
-            JUMPDEST
-            PUSH32(Word::from(0x01))
             PUSH32(Word::from(copy_event_num))
-            PUSH32(Word::from(0x0))
-            JUMPI
+            JUMPDEST
             PUSH32(Word::from(0x04))
             PUSH32(Word::from(0x00))
             PUSH32(Word::from(0x00))
             CALLDATACOPY
+            PUSH32(Word::from(0x01))
+            SWAP1
+            SUB
+            DUP1
+            PUSH32(Word::from(0x2))
+            JUMPI
+            STOP
         };
-        // (0..copy_event_num).for_each(|c| code.append(&code.clone()));
 
         let test_ctx = TestContext::<2, 1>::new(
             None,
@@ -138,6 +141,8 @@ mod tests {
         builder
             .handle_block(&block.eth_block, &block.geth_traces)
             .unwrap();
-        block_convert(&builder.block, &builder.code_db)
+        let block = block_convert(&builder.block, &builder.code_db);
+        assert_eq!(block.copy_events.len(), copy_event_num);
+        block
     }
 }
