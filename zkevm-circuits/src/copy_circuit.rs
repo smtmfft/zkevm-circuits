@@ -747,7 +747,8 @@ pub mod dev {
     };
 
     #[derive(Clone)]
-    struct CopyCircuitTesterConfig<F> {
+    /// copy circuit tester config
+    pub struct CopyCircuitTesterConfig<F> {
         tx_table: TxTable,
         rw_table: RwTable,
         bytecode_table: BytecodeTable,
@@ -755,19 +756,24 @@ pub mod dev {
     }
 
     #[derive(Default)]
-    struct CopyCircuitTester<F> {
+    /// copy circuit tester
+    pub struct CopyCircuitTester<F> {
         block: Block<F>,
         randomness: F,
     }
 
     impl<F: Field> CopyCircuitTester<F> {
-        fn get_randomness() -> F {
+        /// get randomness
+        pub fn get_randomness() -> F {
             F::random(rand::thread_rng())
         }
 
+        /// new CopyCircuitTester
         pub fn new(block: Block<F>, randomness: F) -> Self {
             Self { block, randomness }
         }
+
+        /// r
         pub fn r() -> Expression<F> {
             123456u64.expr()
         }
