@@ -356,6 +356,7 @@ dependencies = [
  "mock",
  "pretty_assertions",
  "rand",
+ "rlp",
  "serde",
  "serde_json",
  "strum",

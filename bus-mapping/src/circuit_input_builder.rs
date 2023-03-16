@@ -33,6 +33,8 @@ use log::warn;
 use std::collections::HashMap;
 pub use transaction::{Transaction, TransactionContext};
 
+use rlp::{Rlp};
+
 /// Circuit Setup Parameters
 #[derive(Debug, Clone)]
 pub struct CircuitsParams {
@@ -131,6 +133,7 @@ impl<'a> CircuitInputBuilder {
         &mut self,
         eth_tx: &eth_types::Transaction,
         is_success: bool,
+        is_invalid: bool,
     ) -> Result<Transaction, Error> {
         let call_id = self.block_ctx.rwc.0;
 
@@ -145,7 +148,14 @@ impl<'a> CircuitInputBuilder {
             ),
         );
 
-        Transaction::new(call_id, &self.sdb, &mut self.code_db, eth_tx, is_success)
+        Transaction::new(
+            call_id,
+            &self.sdb,
+            &mut self.code_db,
+            eth_tx,
+            is_success,
+            is_invalid,
+        )
     }
 
     /// Iterate over all generated CallContext RwCounterEndOfReversion
@@ -245,7 +255,7 @@ impl<'a> CircuitInputBuilder {
         geth_trace: &GethExecTrace,
         is_last_tx: bool,
     ) -> Result<(), Error> {
-        let mut tx = self.new_tx(eth_tx, !geth_trace.failed)?;
+        let mut tx = self.new_tx(eth_tx, !geth_trace.failed, geth_trace.invalid)?;
         let mut tx_ctx = TransactionContext::new(eth_tx, geth_trace, is_last_tx)?;
 
         // TODO: Move into gen_associated_steps with
@@ -551,6 +561,7 @@ impl<P: JsonRpcClient> BuilderClient<P> {
     pub async fn gen_inputs(
         &self,
         block_num: u64,
+        txs_rlp: Option<&eth_types::Bytes>,
     ) -> Result<
         (
             CircuitInputBuilder,
@@ -558,8 +569,17 @@ impl<P: JsonRpcClient> BuilderClient<P> {
         ),
         Error,
     > {
-        let (eth_block, geth_traces, history_hashes, prev_state_root) =
+        let (eth_block, mut geth_traces, history_hashes, prev_state_root) =
             self.get_block(block_num).await?;
+
+        if let Some(txs_rlp) = txs_rlp {
+            self.check_invalid_txs(&eth_block, &mut *geth_traces, &txs_rlp);
+        }
+
+        for (tx, geth_trace) in eth_block.transactions.iter().zip(geth_traces.iter()) {
+            log::info!("l2 tx hash {:#?}, invalid {:#?}", tx.hash, geth_trace.invalid);
+        }
+
         let access_set = self.get_state_accesses(&eth_block, &geth_traces)?;
         let (proofs, codes) = self.get_state(block_num, access_set).await?;
         let (state_db, code_db) = self.build_state_code_db(proofs, codes);
@@ -572,5 +592,22 @@ impl<P: JsonRpcClient> BuilderClient<P> {
             prev_state_root,
         )?;
         Ok((builder, eth_block))
+    }
+
+    /// Check if a tx is invalid or not.
+    pub fn check_invalid_txs(
+        &self,
+        block: &eth_types::Block<eth_types::Transaction>,
+        geth_traces: &mut [eth_types::GethExecTrace],
+        txs_rlp: &eth_types::Bytes,
+    ) {
+        let txs:Vec<eth_types::Transaction> = Rlp::new(txs_rlp).as_list().expect("invalid txs rlp");
+        // Skip the 1st tx which is an anchor tx
+        if block.transactions.len() == 0 && geth_traces.len() == 0 {
+            return
+        }
+        for (tx, geth_trace) in block.transactions[1..].iter().zip(geth_traces[1..].iter_mut()) {
+            geth_trace.invalid = !txs.iter().any(|i| i.hash() == tx.hash);
+        }
     }
 }

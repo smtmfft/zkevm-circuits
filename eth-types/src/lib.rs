@@ -398,6 +398,9 @@ pub struct ResultGethExecTrace {
 /// before the step is executed.
 #[derive(Deserialize, Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct GethExecTrace {
+    /// True when the tx could not execute
+    #[serde(default = "default_bool")]
+    pub invalid: bool,
     /// Used gas
     pub gas: Gas,
     /// True when the transaction has failed.
@@ -408,6 +411,10 @@ pub struct GethExecTrace {
     /// Vector of geth execution steps of the trace.
     #[serde(rename = "structLogs")]
     pub struct_logs: Vec<GethExecStep>,
+}
+
+fn default_bool() -> bool {
+    false
 }
 
 #[macro_export]
@@ -516,6 +523,7 @@ mod tests {
         assert_eq!(
             trace,
             GethExecTrace {
+                invalid: false,
                 gas: Gas(26809),
                 failed: false,
                 return_value: "".to_owned(),
