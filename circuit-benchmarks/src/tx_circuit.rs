@@ -5,6 +5,7 @@ mod tests {
     use ark_std::{end_timer, start_timer};
     use bus_mapping::circuit_input_builder::{BuilderClient, CircuitsParams};
     use env_logger::Env;
+    use halo2_proofs::dev::MockProver;
     use halo2_proofs::plonk::{create_proof, keygen_pk, keygen_vk, verify_proof};
     use halo2_proofs::poly::kzg::commitment::{KZGCommitmentScheme, ParamsKZG, ParamsVerifierKZG};
     use halo2_proofs::poly::kzg::multiopen::{ProverSHPLONK, VerifierSHPLONK};
@@ -20,9 +21,11 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
     use std::env::var;
+    use std::marker::PhantomData;
+    use zkevm_circuits::rlp_circuit::RlpCircuit;
     use zkevm_circuits::tx_circuit::TxCircuit;
     use zkevm_circuits::util::SubCircuit;
-    use zkevm_circuits::witness::block_convert;
+    use zkevm_circuits::witness::{block_convert, SignedTransaction};
 
     use bus_mapping::rpc::GethClient;
     use ethers::providers::Http;
@@ -64,21 +67,27 @@ mod tests {
         (degree, circuit)
     }
 
-    fn build_circuit_from_mock_txs() -> (usize, TxCircuit<Fr>) {
+    fn build_circuit_from_mock_txs() -> (usize, RlpCircuit<Fr, SignedTransaction>) {
         // Approximate value, adjust with changes on the TxCircuit.
         const ROWS_PER_TX: usize = 175_000;
 
         const MAX_CALLDATA: usize = 1024;
         let degree: u32 = var("DEGREE")
-            .unwrap_or_else(|_| "19".to_string())
+            .unwrap_or_else(|_| "20".to_string())
             .parse()
             .expect("Cannot parse DEGREE env var as u32");
 
-        let max_txs: usize = 2_usize.pow(degree) / ROWS_PER_TX;
+        let max_txs: usize = 2;
 
         let chain_id: u64 = mock::MOCK_CHAIN_ID.low_u64();
         let txs = vec![mock::CORRECT_MOCK_TXS[0].clone().into()];
-        let circuit = TxCircuit::<Fr>::new(max_txs, MAX_CALLDATA, chain_id, txs);
+        let circuit = RlpCircuit::<Fr, SignedTransaction> {
+            inputs: ethers::utils::rlp::encode_list(&txs).into(),
+            max_txs,
+            size: 1 << degree,
+            _marker: PhantomData,
+            _marker_1: PhantomData,
+        };
         (degree as usize, circuit)
     }
 
@@ -92,13 +101,14 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
 
         //Unique string used by bench results module for parsing the result
-        const BENCHMARK_ID: &str = "Tx Circuit";
+        const BENCHMARK_ID: &str = "Rlp Circuit";
 
         let mock_mode = true;
         let (degree, circuit) = if mock_mode {
             build_circuit_from_mock_txs()
         } else {
-            build_circuit_from_mainnet_block().await
+            // build_circuit_from_mainnet_block().await
+            unreachable!("not impl")
         };
 
         // Bench setup generation
@@ -114,6 +124,17 @@ mod tests {
         // Create a proof
         let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(vec![]);
 
+        let prover = MockProver::<Fr>::run(degree as u32, &circuit, vec![]).unwrap();
+        let err = prover.verify_par();
+        let print_failures = true;
+        if err.is_err() && print_failures {
+            if let Some(e) = err.err() {
+                for s in e.iter() {
+                    println!("{}", s);
+                }
+            }
+        }
+
         // Bench proof generation time
         let proof_message = format!(
             "{} {} with degree = {}",
@@ -126,12 +147,12 @@ mod tests {
             Challenge255<G1Affine>,
             ChaCha20Rng,
             Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
-            TxCircuit<Fr>,
+            RlpCircuit<Fr, SignedTransaction>,
         >(
             &general_params,
             &pk,
             &[circuit],
-            &[&[&[]]],
+            &[&[]],
             rng,
             &mut transcript,
         )
@@ -154,7 +175,7 @@ mod tests {
             &verifier_params,
             pk.get_vk(),
             strategy,
-            &[&[&[]]],
+            &[&[]],
             &mut verifier_transcript,
         )
         .expect("failed to verify bench circuit");

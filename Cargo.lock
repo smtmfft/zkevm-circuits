@@ -6756,6 +6756,7 @@ dependencies = [
 name = "zkevm-circuits"
 version = "0.1.0"
 dependencies = [
+ "ark-std",
  "array-init",
  "bus-mapping",
  "criterion",

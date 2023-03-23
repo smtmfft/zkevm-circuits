@@ -77,6 +77,14 @@ lazy_static! {
                 .gas_price(word!("0x4d2"))
                 .input(Bytes::from(b"hello"))
                 .build(),
+            MockTransaction::default()
+                .transaction_idx(7u64)
+                .from(AddrOrWallet::random(&mut rng))
+                .to(AddrOrWallet::Addr(Address::zero()))
+                .nonce(word!("0x1234"))
+                .value(word!("0x54321"))
+                .gas_price(word!("0x100000000000"))
+                .build(),
         ]
     };
 }

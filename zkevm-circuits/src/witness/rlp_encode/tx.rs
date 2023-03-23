@@ -19,8 +19,11 @@ pub enum RlpTxTag {
     #[default]
     Padding = 0,
     /// Denotes the prefix bytes indicating the “length of length” and/or
+    /// “length” of the tx_list’s RLP-encoding.
+    TxListPrefix,
+    /// Denotes the prefix bytes indicating the “length of length” and/or
     /// “length” of the tx’s RLP-encoding.
-    Prefix,
+    TxPrefix,
     /// Denotes the byte(s) for the tx’s nonce.
     Nonce,
     /// Denotes the byte(s) for the tx’s gas price.
@@ -75,7 +78,7 @@ impl<F: FieldExt> RlpWitnessGen<F> for Transaction {
             rlp_data.as_ref(),
             &mut rows,
             RlpDataType::TxSign,
-            RlpTxTag::Prefix,
+            RlpTxTag::TxPrefix,
             0,
         );
         let idx = handle_u64(
@@ -220,7 +223,7 @@ impl<F: FieldExt> RlpWitnessGen<F> for SignedTransaction {
             rlp_data.as_ref(),
             &mut rows,
             RlpDataType::TxHash,
-            RlpTxTag::Prefix,
+            RlpTxTag::TxPrefix,
             0,
         );
         let idx = handle_u64(
@@ -398,12 +401,12 @@ mod tests {
         assert_eq!(tx_rlp.len(), witness_rows.len());
 
         // prefix verification
-        assert_eq!(witness_rows[0].tag, RlpTxTag::Prefix);
+        assert_eq!(witness_rows[0].tag, RlpTxTag::TxPrefix);
         assert_eq!(witness_rows[0].tag_rindex, 2);
         assert_eq!(witness_rows[0].tag_length, 2);
         assert_eq!(witness_rows[0].length_acc, 0);
         assert_eq!(witness_rows[0].value, 248);
-        assert_eq!(witness_rows[1].tag, RlpTxTag::Prefix);
+        assert_eq!(witness_rows[1].tag, RlpTxTag::TxPrefix);
         assert_eq!(witness_rows[1].tag_rindex, 1);
         assert_eq!(witness_rows[1].tag_length, 2);
         assert_eq!(witness_rows[1].length_acc, 84);
@@ -495,17 +498,17 @@ mod tests {
         assert_eq!(tx_rlp.len(), witness_rows.len());
 
         // prefix verification
-        assert_eq!(witness_rows[0].tag, RlpTxTag::Prefix);
+        assert_eq!(witness_rows[0].tag, RlpTxTag::TxPrefix);
         assert_eq!(witness_rows[0].tag_rindex, 3);
         assert_eq!(witness_rows[0].tag_length, 3);
         assert_eq!(witness_rows[0].length_acc, 0);
         assert_eq!(witness_rows[0].value, 249);
-        assert_eq!(witness_rows[1].tag, RlpTxTag::Prefix);
+        assert_eq!(witness_rows[1].tag, RlpTxTag::TxPrefix);
         assert_eq!(witness_rows[1].tag_rindex, 2);
         assert_eq!(witness_rows[1].tag_length, 3);
         assert_eq!(witness_rows[1].length_acc, 8);
         assert_eq!(witness_rows[1].value, 8);
-        assert_eq!(witness_rows[2].tag, RlpTxTag::Prefix);
+        assert_eq!(witness_rows[2].tag, RlpTxTag::TxPrefix);
         assert_eq!(witness_rows[2].tag_rindex, 1);
         assert_eq!(witness_rows[2].tag_length, 3);
         assert_eq!(witness_rows[2].length_acc, 2091);

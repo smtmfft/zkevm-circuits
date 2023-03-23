@@ -26,5 +26,6 @@ rand_chacha = "0.3"
 url="2.2.2"
 
 [features]
-default = []
+default = ["benches"]
 benches = []
+onephase = []
