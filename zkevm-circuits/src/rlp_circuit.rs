@@ -85,9 +85,6 @@ pub struct RlpCircuitConfig<F> {
     /// Denotes whether or not the row is for decode logic.
     /// TODO: combine with q_usable and make advice column
     q_decode_usable: Column<Fixed>,
-    /// Denotes if tag is Rlp Array Prefix, which is for begining decode only.
-    /// TODO: combine with is_prefix_tag
-    is_decode_prefix_tag: Column<Fixed>,
     /// Denotes if the original rlp-encoded data is valid.
     rlp_valid: Column<Advice>,
     /// Denotes the byte value at this row index from the original RLP-encoded
@@ -187,7 +184,6 @@ impl<F: Field> RlpCircuitConfig<F> {
         let placeholder = meta.advice_column();
         let byte_value = meta.advice_column();
         let q_decode_usable = meta.fixed_column();
-        let is_decode_prefix_tag = meta.fixed_column();
         let rlp_valid = meta.advice_column();
         let input_byte_value = meta.advice_column();
         let input_bytes_rlc_acc = meta.advice_column_in(SecondPhase);
@@ -226,7 +222,6 @@ impl<F: Field> RlpCircuitConfig<F> {
         debug_print!(&placeholder);
         debug_print!(&byte_value);
         debug_print!(&q_decode_usable);
-        debug_print!(&is_decode_prefix_tag);
         debug_print!(&rlp_valid);
         debug_print!(&input_byte_value);
         debug_print!(&input_bytes_rlc_acc);
@@ -247,7 +242,7 @@ impl<F: Field> RlpCircuitConfig<F> {
                 };
             };
         }
-        is_tx_tag!(is_tx_list_prefix, TxListPrefix);
+        is_tx_tag!(is_decode_prefix_tag, TxListPrefix);
         is_tx_tag!(is_tx_prefix, TxPrefix);
         is_tx_tag!(is_nonce, Nonce);
         is_tx_tag!(is_gas_price, GasPrice);
@@ -1399,7 +1394,7 @@ impl<F: Field> RlpCircuitConfig<F> {
         make_value_cmp_gadget!(input_value_lt_248 < 248);
 
         meta.create_gate("Common constraints for decoding columns", |meta| {
-            let mut cb = BaseConstraintBuilder::new(9);
+            let mut cb = BaseConstraintBuilder::new(10);
 
             let (tindex_lt, tindex_eq) = tag_index_cmp_1.expr(meta, None);
             assert_eq!(tindex_lt.degree(), 1, "{}", tindex_lt.degree());
@@ -1408,7 +1403,6 @@ impl<F: Field> RlpCircuitConfig<F> {
             let (tindex_lt_tlength, tindex_eq_tlength) = tag_index_length_cmp.expr(meta, None);
             let (length_acc_gt_0, length_acc_eq_0) = length_acc_cmp_0.expr(meta, None);
             let is_simple_tag = meta.query_advice(is_simple_tag, Rotation::cur());
-            let is_decode_prefix_tag = meta.query_fixed(is_decode_prefix_tag, Rotation::cur());
             let is_dp_tag = meta.query_advice(is_dp_tag, Rotation::cur());
             let is_rlp_valid = meta.query_advice(rlp_valid, Rotation::cur());
 
@@ -1416,7 +1410,7 @@ impl<F: Field> RlpCircuitConfig<F> {
             ////////////////////////////////// RlpHeaderTag::Prefix //////////////////////////////
             //////////////////////////////////////////////////////////////////////////////////////
             // TODO: merge to tx prefix
-            cb.condition(is_decode_prefix_tag.expr(), |cb| {
+            cb.condition(is_decode_prefix_tag(meta), |cb| {
                 // tag_index < 10
                 cb.require_equal(
                     "tag_index < 10",
@@ -1432,7 +1426,7 @@ impl<F: Field> RlpCircuitConfig<F> {
             });
 
             // if tag_index > 1
-            cb.condition(is_decode_prefix_tag.expr() * tindex_lt.clone() * is_rlp_valid.clone(), |cb| {
+            cb.condition(is_decode_prefix_tag(meta) * tindex_lt.clone() * is_rlp_valid.clone(), |cb| {
                 cb.require_equal(
                     "tag::next == RlpTxTag::TxListPrefix",
                     meta.query_advice(rlp_table.tag, Rotation::next()),
@@ -1451,7 +1445,7 @@ impl<F: Field> RlpCircuitConfig<F> {
             });
 
             // if tag_index == 1, RlpArrayPrefix -> RlpTxPrefix (another array prefix for legacy Tx)
-            cb.condition(is_decode_prefix_tag.expr() * tindex_eq.clone() * is_rlp_valid.clone(), |cb| {
+            cb.condition(is_decode_prefix_tag(meta) * tindex_eq.clone() * is_rlp_valid.clone(), |cb| {
                 cb.require_equal(
                     "next row below array prefix is tx prefix",
                     meta.query_advice(is_prefix_tag, Rotation::next()),
@@ -1476,7 +1470,7 @@ impl<F: Field> RlpCircuitConfig<F> {
 
             // if tag_index == tag_length && tag_length > 1
             cb.condition(
-                is_decode_prefix_tag.expr() * tindex_eq_tlength.clone() * tlength_lt.clone() * is_rlp_valid.clone(),
+                is_decode_prefix_tag(meta) * tindex_eq_tlength.clone() * tlength_lt.clone() * is_rlp_valid.clone(),
                 |cb| {
                     cb.require_equal("247 < value", value_gt_247.is_lt(meta, None), 1.expr());
                     // cb.require_equal("value < 256", value_lt_256.is_lt(meta, None), 1.expr());
@@ -1494,7 +1488,7 @@ impl<F: Field> RlpCircuitConfig<F> {
 
             // if tag_index < tag_length && tag_length > 1
             cb.condition(
-                is_decode_prefix_tag.expr() * tindex_lt_tlength.clone() * tlength_lt.clone() * is_rlp_valid.clone(),
+                is_decode_prefix_tag(meta) * tindex_lt_tlength.clone() * tlength_lt.clone() * is_rlp_valid.clone(),
                 |cb| {
                     cb.require_equal(
                         "length_acc == (length_acc::prev * 256) + value",
@@ -1507,7 +1501,7 @@ impl<F: Field> RlpCircuitConfig<F> {
 
             // check the value is decodable.
             cb.condition(
-                is_decode_prefix_tag.expr() * tindex_eq_tlength.clone() * tlength_lt.clone(),
+                is_decode_prefix_tag(meta) * tindex_eq_tlength.clone() * tlength_lt.clone(),
                 |cb| {
                     cb.require_equal("247 < value", input_value_gt_247.is_lt(meta, None), is_rlp_valid.clone());
                 },
@@ -1622,7 +1616,6 @@ impl<F: Field> RlpCircuitConfig<F> {
             placeholder,
             byte_value,
             q_decode_usable,
-            is_decode_prefix_tag,
             rlp_valid,
             input_byte_value,
             input_bytes_rlc_acc,
@@ -1835,15 +1828,6 @@ impl<F: Field> RlpCircuitConfig<F> {
                             self.input_bytes_left,
                             offset + i as usize,
                             || Value::known(F::from(bytes_left as u64)),
-                        )?;
-                    }
-
-                    if i < txlist_prefix_len {
-                        region.assign_fixed(
-                            || format!("decoder prefix: {}", offset),
-                            self.is_decode_prefix_tag,
-                            offset + i as usize,
-                            || Value::known(F::from(valid as u64)),
                         )?;
                     }
 
@@ -2276,7 +2260,7 @@ impl<F: Field> SubCircuit<F> for RlpCircuit<F, SignedTransaction> {
             // FIXME: this hard-coded size is used to pass unit test, we should use 1 << k instead.
             size: 1 << 18,
             witness: vec![],
-            signed_txs: vec![],
+            signed_txs: signed_txs,
             rlp_valid: false,
             _marker: Default::default(),
         }
@@ -2770,7 +2754,8 @@ mod tests {
             true,
             false,
         );
-    }}
+    }
+}
 
 #[cfg(test)]
 mod rlp_test {
