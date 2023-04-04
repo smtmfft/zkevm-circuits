@@ -80,13 +80,15 @@ mod tests {
         let max_txs: usize = 2;
 
         let chain_id: u64 = mock::MOCK_CHAIN_ID.low_u64();
-        let txs = vec![mock::CORRECT_MOCK_TXS[0].clone().into()];
+        let txs: Vec<SignedTransaction> = vec![mock::CORRECT_MOCK_TXS[0].clone().into()];
         let circuit = RlpCircuit::<Fr, SignedTransaction> {
             inputs: ethers::utils::rlp::encode_list(&txs).into(),
             max_txs,
             size: 1 << degree,
+            witness: vec![],
+            signed_txs: vec![],
+            rlp_valid: false,
             _marker: PhantomData,
-            _marker_1: PhantomData,
         };
         (degree as usize, circuit)
     }
