@@ -25,6 +25,7 @@ pub mod exp_circuit;
 pub mod keccak_circuit;
 pub mod mpt_circuit;
 pub mod pi_circuit;
+pub mod rlp_decoder;
 pub mod root_circuit;
 pub mod state_circuit;
 pub mod super_circuit;
@@ -40,5 +41,5 @@ pub mod tx_circuit;
 pub mod util;
 pub mod witness;
 
-// extern crate gadgets;
+extern crate gadgets;
 pub use gadgets::impl_expr;
