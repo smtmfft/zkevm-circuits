@@ -1,25 +1,25 @@
 //! The rlp decoding transaction list circuit implementation.
 
-// Naming notes:
-// - *_be: Big-Endian bytes
-// - *_le: Little-Endian bytes
+use std::marker::PhantomData;
 
 use crate::{
     evm_circuit::util::{constraint_builder::BaseConstraintBuilder, rlc},
     impl_expr,
-    table::{KeccakTable, TxFieldTag, TxTable},
-    util::{Challenges, SubCircuit, SubCircuitConfig},
+    table::{KeccakTable, TxTable},
+    util::{log2_ceil, Challenges, SubCircuit, SubCircuitConfig},
     witness,
 };
-use eth_types::{
-    sign_types::SignData, Address, Field, Signature, ToBigEndian, ToLittleEndian, ToScalar, ToWord,
-    Transaction, Word,
+use eth_types::{Field, Signature, Transaction, Word};
+use ethers_core::{
+    types::TransactionRequest,
+    utils::rlp::{self, PayloadInfo},
 };
-use ethers_core::{types::TransactionRequest, utils::rlp};
-use gadgets::{evm_word::r, util::not};
+use gadgets::util::{and, not};
 use halo2_proofs::{
-    circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Selector},
+    circuit::{Layouter, Region, SimpleFloorPlanner, Value},
+    plonk::{
+        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, SecondPhase, Selector,
+    },
     poly::Rotation,
 };
 // use itertools::Itertools;
@@ -27,6 +27,7 @@ use halo2_proofs::{
 // use sign_verify::{AssignedSignatureVerify, SignVerifyChip, SignVerifyConfig};
 // use std::marker::PhantomData;
 
+use crate::util::Expr;
 pub use halo2_proofs::halo2curves::{
     group::{
         ff::{Field as GroupField, PrimeField},
@@ -37,19 +38,37 @@ pub use halo2_proofs::halo2curves::{
 };
 use mock::MockTransaction;
 
-use crate::util::Expr;
+const NUM_BLINDING_ROWS: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// RlpDecodeTypeTag is used to index the flag of rlp decoding type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RlpDecodeTypeTag {
-    SingleByte,  // 0x00 - 0x7f
-    NullValue,   // 0x80
-    ShortString, // 0x81~0x88 should be enough
-    EmptyList,   // 0xc0
-    LongList1,   // 0xc1 ~ 0xf7
-    LongList2,   // 0xf8
-    LongList3,   // 0xf9, 0xFFFF upto (64K)
-    // LongList4,   // 0xfa, 0xFFFFFF upto (16M)
-    PartialRlp, // for those rlp that is not complete
+    #[default]
+    /// SingleByte: 0x00 - 0x7f
+    SingleByte,
+    /// NullValue: 0x80
+    NullValue,
+    /// ShortString: 0x81~0xb7
+    ShortString,
+    /// LongString: 0xb8
+    LongString1,
+    /// LongString: 0xb9
+    LongString2,
+    /// LongString: 0xba
+    LongString3,
+    /// EmptyList: 0xc0
+    EmptyList,
+    /// ShortList: 0xc1 ~ 0xf7
+    ShortList,
+    /// LongList1: 0xf8
+    LongList1,
+    /// LongList2: 0xf9, 0xFFFF upto (64K)
+    LongList2,
+    /// LongList3: 0xfa, 0xFFFFFF upto (16M)
+    LongList3,
+    /// PartialRlp: for those rlp that is not complete
+    PartialRlp,
+    /// RlpDecodeTypeNum,
     RlpDecodeTypeNum,
 }
 impl_expr!(RlpDecodeTypeTag);
@@ -89,24 +108,43 @@ struct RlpDecodeTable {
 }
 
 // TODO: combine with TxFieldTag in table.rs
-/// Marker that defines whether an Operation performs a `READ` or a `WRITE`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// Marker that defines whether an Operation performs a `READ` or a `WRITE`.
+/// RlpTxFieldTag is used to tell the field of tx, used as state in the circuit
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RlpTxFieldTag {
-    // for legacy tx
+    #[default]
+    /// for tx list rlp header
+    TxListRlpHeader,
+    /// for rlp header
+    TxRlpHeader,
+    /// for tx nonce
     Nonce,
+    /// gas price
     GasPrice,
+    /// Gas
     Gas,
+    /// To
     To,
+    /// Value
     Value,
+    /// Data
     Data,
+    /// SignV
     SignV,
+    /// SignR
     SignR,
+    /// SignS
     SignS,
+    /// Padding
     Padding,
     // 1559 extra field
+    /// ChainID
     ChainID,
+    /// GasTipCap
     GasTipCap,
+    /// GasFeeCap
     GasFeeCap,
+    /// AccessList
     AccessList,
 }
 impl_expr!(RlpTxFieldTag);
@@ -127,19 +165,65 @@ impl<T> std::ops::Index<RlpTxFieldTag> for Vec<T> {
     }
 }
 
-const LegacyTxFieldNum: usize = RlpTxFieldTag::Padding as usize + 1 as usize;
-const Tx1559TxFieldNum: usize = RlpTxFieldTag::AccessList as usize + 1 as usize;
+const LEGACY_TX_FIELD_NUM: usize = RlpTxFieldTag::Padding as usize + 1;
+const TX1559_TX_FIELD_NUM: usize = RlpTxFieldTag::AccessList as usize + 1;
 
 // TODO: combine with TxFieldTag in table.rs
-/// Marker that defines whether an Operation performs a `READ` or a `WRITE`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+// Marker that defines whether an Operation performs a `READ` or a `WRITE`.
+/// RlpTxTypeTag is used to tell the type of tx
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RlpTxTypeTag {
+    #[default]
+    /// legacy tx
     TxLegacyType,
+    /// 1559 tx
     Tx1559Type,
 }
 impl_expr!(RlpTxTypeTag);
 
-const MAX_BYTE_COLUMN: usize = 33;
+const MAX_BYTE_COLUMN_NUM: usize = 33;
+
+/// Witness for RlpDecoderCircuit
+#[derive(Clone, Debug, Default)]
+pub struct RlpDecoderCircuitConfigWitness<F: Field> {
+    /// tx_id column
+    pub tx_id: u64,
+    /// tx_type column
+    pub tx_type: RlpTxTypeTag,
+    /// tag column
+    pub tag: RlpTxFieldTag,
+    /// complete column
+    pub complete: bool,
+    /// rlp types: [single, short, long, very_long, fixed(33)]
+    pub rlp_types: [bool; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
+    /// rlp_tag_length, the length of this rlp field
+    pub rlp_tag_length: u64,
+    /// remained rows, for n < 33 fields, it is n, for m > 33 fields, it is 33 and next row is
+    /// partial, next_length = m - 33
+    pub tag_bytes_in_row: u8,
+    /// r_mult column, (length, r_mult) => @fixed
+    pub r_mult: F,
+    /// remain_length
+    pub rlp_remain_length: usize,
+    /// value
+    pub value: F,
+    /// acc_rlc_value
+    pub acc_rlc_value: F,
+    /// bytes
+    pub bytes: Vec<u8>, //[u8; MAX_BYTE_COLUMN],
+    /// decodable, 0 for decode failed, 1 for success
+    pub decodable: bool,
+    /// valid, 0 for invalid, 1 for valid, should be == decodable at the end of the circuit
+    pub valid: bool,
+    /// dynamic selector for fields
+    pub q_fields: [bool; LEGACY_TX_FIELD_NUM as usize],
+    /// full chip enable
+    pub q_enable: bool,
+    /// the begining
+    pub q_first: bool,
+    /// the end
+    pub q_last: bool,
+}
 
 /// Config for RlpDecoderCircuit
 #[derive(Clone, Debug)]
@@ -168,13 +252,13 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     /// acc_rlc_value
     pub acc_rlc_value: Column<Advice>,
     /// bytes
-    pub bytes: [Column<Advice>; MAX_BYTE_COLUMN],
+    pub bytes: [Column<Advice>; MAX_BYTE_COLUMN_NUM],
     /// decodable, 0 for decode failed, 1 for success
     pub decodable: Column<Advice>,
     /// valid, 0 for invalid, 1 for valid, should be == decodable at the end of the circuit
     pub valid: Column<Advice>,
     /// dynamic selector for fields
-    pub q_fields: [Column<Advice>; LegacyTxFieldNum as usize],
+    pub q_fields: [Column<Advice>; LEGACY_TX_FIELD_NUM as usize],
     /// full chip enable
     pub q_enable: Selector,
     /// the begining
@@ -205,23 +289,55 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         let tx_type = meta.advice_column();
         let tag = meta.advice_column();
         let complete = meta.advice_column();
-        let rlp_types = [meta.advice_column(); RlpDecodeTypeTag::RlpDecodeTypeNum as usize];
+        let rlp_types: [Column<Advice>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] = (0
+            ..RlpDecodeTypeTag::RlpDecodeTypeNum as usize)
+            .map(|_| meta.advice_column())
+            .collect::<Vec<Column<Advice>>>()
+            .try_into()
+            .unwrap();
         let rlp_tag_length = meta.advice_column();
         let tag_bytes_in_row = meta.advice_column();
         let rlp_remain_length = meta.advice_column();
         let r_mult = meta.advice_column();
         let value = meta.advice_column();
-        let acc_rlc_value = meta.advice_column();
-        let bytes = [meta.advice_column(); 33];
+        let acc_rlc_value = meta.advice_column_in(SecondPhase);
+        let bytes: [Column<Advice>; MAX_BYTE_COLUMN_NUM] = (0..MAX_BYTE_COLUMN_NUM as usize)
+            .map(|_| meta.advice_column())
+            .collect::<Vec<Column<Advice>>>()
+            .try_into()
+            .unwrap();
         let decodable = meta.advice_column();
         let valid = meta.advice_column();
-        let q_fields = [meta.advice_column(); LegacyTxFieldNum];
+        let q_fields: [Column<Advice>; LEGACY_TX_FIELD_NUM as usize] = (0..LEGACY_TX_FIELD_NUM)
+            .map(|_| meta.advice_column())
+            .collect::<Vec<Column<Advice>>>()
+            .try_into()
+            .unwrap();
         let q_enable = meta.selector();
         let q_first = meta.fixed_column();
         let q_last = meta.fixed_column();
 
-        // common logic
-        meta.create_gate("common", |meta| {
+        // TODO: lookup rlp_types table, which may also include bytes[1] as prefix of len
+        // also need to be constrainted
+        // TODO: lookup r_mult table with length, also as r_mult is adv, add constraint for pow
+        // TODO: lookup bytes range table
+        // TODO: lookup q_fields table
+
+        meta.create_gate("common constraints for all rows", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            let valid_cur = meta.query_advice(valid, Rotation::cur());
+            let valid_next = meta.query_advice(valid, Rotation::next());
+            cb.require_equal("valid should be consistent", valid_cur, valid_next);
+
+            cb.gate(and::expr([
+                meta.query_selector(q_enable),
+                not::expr(meta.query_fixed(q_last, Rotation::cur())),
+            ]))
+        });
+
+        // common logic for tx fields
+        meta.create_gate("tx fields common constraints", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
             let tx_id = meta.query_advice(tx_id, Rotation::cur());
@@ -241,7 +357,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
             let value = meta.query_advice(value, Rotation::cur());
             let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
-            let bytes = bytes
+            let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
@@ -252,6 +368,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
                 .collect::<Vec<_>>();
             let q_enable = meta.query_selector(q_enable);
+            let q_first = meta.query_fixed(q_first, Rotation::cur());
 
             // cb.require_boolean("q_enable boolean", q_enable);
             cb.require_boolean("field complete boolean", complete_cur.expr());
@@ -265,38 +382,76 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 cb.require_boolean("rlp_type boolean", rlp_type_cur.expr());
             });
 
-            // length without leading bytes
+            // length with leading bytes
             cb.condition(rlp_types_cur[RlpDecodeTypeTag::SingleByte].expr(), |cb| {
                 cb.require_equal("single length", rlp_tag_length_cur.clone(), 1.expr())
             });
             cb.condition(rlp_types_cur[RlpDecodeTypeTag::NullValue].expr(), |cb| {
-                cb.require_equal("empty length", rlp_tag_length_cur.clone(), 0.expr())
+                cb.require_equal("empty length", rlp_tag_length_cur.clone(), 1.expr())
             });
             cb.condition(rlp_types_cur[RlpDecodeTypeTag::ShortString].expr(), |cb| {
                 cb.require_equal(
-                    "single string length",
+                    "ShortString length",
                     rlp_tag_length_cur.clone(),
-                    bytes[0].expr() - 0x80.expr(),
+                    byte_cells_cur[0].expr() - 0x80.expr() + 1.expr(),
+                )
+            });
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongString1].expr(), |cb| {
+                cb.require_equal(
+                    "Long String 0xb8 length",
+                    rlp_tag_length_cur.clone(),
+                    byte_cells_cur[1].expr() + 2.expr(),
+                )
+            });
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongString2].expr(), |cb| {
+                cb.require_equal(
+                    "Long String 0xb9 length",
+                    rlp_tag_length_cur.clone(),
+                    byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr() + 3.expr(),
+                )
+            });
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongString3].expr(), |cb| {
+                cb.require_equal(
+                    "Long String 0xba length",
+                    rlp_tag_length_cur.clone(),
+                    byte_cells_cur[1].expr() * 65536.expr()
+                        + byte_cells_cur[2].expr() * 256.expr()
+                        + byte_cells_cur[3].expr()
+                        + 4.expr(),
                 )
             });
             cb.condition(rlp_types_cur[RlpDecodeTypeTag::EmptyList].expr(), |cb| {
-                cb.require_equal("empty list length", rlp_tag_length_cur.clone(), 0.expr())
+                cb.require_equal("empty list length", rlp_tag_length_cur.clone(), 1.expr())
             });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList1].expr(), |cb| {
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::ShortList].expr(), |cb| {
                 cb.require_equal(
                     "short length",
                     rlp_tag_length_cur.clone(),
-                    bytes[0].expr() - 0xc0.expr(),
+                    byte_cells_cur[0].expr() - 0xc0.expr() + 1.expr(),
+                )
+            });
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList1].expr(), |cb| {
+                cb.require_equal(
+                    "long length: f8 + 1",
+                    rlp_tag_length_cur.clone(),
+                    byte_cells_cur[1].expr() + 2.expr(),
                 )
             });
             cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList2].expr(), |cb| {
-                cb.require_equal("long length", rlp_tag_length_cur.clone(), bytes[1].expr())
+                cb.require_equal(
+                    "long length: f9 + 2",
+                    rlp_tag_length_cur.clone(),
+                    byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr() + 3.expr(),
+                )
             });
             cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList3].expr(), |cb| {
                 cb.require_equal(
-                    "long length",
+                    "long length: fa + 3",
                     rlp_tag_length_cur.clone(),
-                    bytes[1].expr() * 256.expr() + bytes[2].expr(),
+                    byte_cells_cur[1].expr() * 65536.expr()
+                        + byte_cells_cur[2].expr() * 256.expr()
+                        + byte_cells_cur[3].expr()
+                        + 4.expr(),
                 )
             });
             cb.condition(rlp_types_cur[RlpDecodeTypeTag::PartialRlp].expr(), |cb| {
@@ -304,7 +459,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     "length = prev_length - prev_bytes_in_row",
                     rlp_tag_length_cur.clone(),
                     meta.query_advice(rlp_tag_length, Rotation::prev())
-                        - tag_bytes_in_row_cur.expr(),
+                        - meta.query_advice(tag_bytes_in_row, Rotation::prev()),
                 );
 
                 cb.require_zero(
@@ -315,9 +470,9 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             cb.condition(complete_cur.expr(), |cb| {
                 cb.require_equal(
-                    "complete = 1 => remain_length = bytes_in_row",
+                    "complete = 1 => rlp_tag_length = bytes_in_row",
                     tag_bytes_in_row_cur.expr(),
-                    remain_length.expr(),
+                    rlp_tag_length_cur.expr(),
                 );
 
                 cb.require_equal(
@@ -328,20 +483,26 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 );
             });
 
+            cb.condition(not::expr(complete_cur.expr()), |cb| {
+                cb.require_equal(
+                    "!complete => MAX_BYTES_COL == bytes_in_row",
+                    tag_bytes_in_row_cur.expr(),
+                    MAX_BYTE_COLUMN_NUM.expr(),
+                );
+            });
+
             cb.require_equal(
                 "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
                 acc_rlc_cur,
                 r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
-                    + rlc::expr(
-                        bytes.iter().rev().collect::<Vec<_>>().as_ref(),
-                        &args.challenges.keccak_input(),
-                    ),
+                    + rlc::expr(&byte_cells_cur, args.challenges.keccak_input()),
             );
 
-            // TODO: lookup rlp_types table
-            // TODO: lookup r_mult table
-            // TODO: lookup bytes range table
-            cb.gate(q_enable)
+            cb.gate(and::expr([
+                q_enable,
+                not::expr(q_first),
+                not::expr(q_fields[RlpTxFieldTag::TxRlpHeader].expr()),
+            ]))
         });
 
         // TxListHeader in the first row
@@ -353,12 +514,20 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let tag_cur = meta.query_advice(tag, Rotation::cur());
             let tag_next = meta.query_advice(tag, Rotation::next());
             let complete = meta.query_advice(complete, Rotation::cur());
-            let length = meta.query_advice(rlp_tag_length, Rotation::cur());
+            let rlp_types_cur: [Expression<F>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] =
+                rlp_types
+                    .iter()
+                    .map(|rlp_type| meta.query_advice(*rlp_type, Rotation::cur()))
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap();
+
+            let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
             let value = meta.query_advice(value, Rotation::cur());
-            let acc_rlc_value = meta.query_advice(acc_rlc_value, Rotation::cur());
-            let bytes = bytes
+            let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
+            let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
@@ -379,7 +548,14 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     tx_type_next,
                     RlpTxTypeTag::TxLegacyType.expr(),
                 );
-                cb.require_equal("next field is nonce", tag_next, RlpTxFieldTag::Nonce.expr());
+                cb.require_in_set(
+                    "next field is txRlpHeader or Padding",
+                    tag_next,
+                    vec![
+                        RlpTxFieldTag::TxRlpHeader.expr(),
+                        RlpTxFieldTag::Padding.expr(),
+                    ],
+                );
             });
 
             // TODO: enable 1559
@@ -397,16 +573,131 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             //     );
             // });
 
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList1].expr(), |cb| {
+                cb.require_equal(
+                    "long length: f8 + 1",
+                    remain_length.expr(),
+                    byte_cells_cur[1].expr(),
+                )
+                // TODO: byte_cells_cur[1] in (0, 55]
+            });
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList2].expr(), |cb| {
+                cb.require_equal(
+                    "long length: f9 + 2",
+                    remain_length.expr(),
+                    byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr(),
+                )
+
+                // TODO: byte_cells_cur[1] != 0
+            });
+            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList3].expr(), |cb| {
+                cb.require_equal(
+                    "long length: fa + 3",
+                    remain_length.expr(),
+                    byte_cells_cur[1].expr() * 65536.expr()
+                        + byte_cells_cur[2].expr() * 256.expr()
+                        + byte_cells_cur[3].expr(),
+                )
+                // TODO: byte_cells_cur[1] != 0
+            });
+
+            cb.condition(decodable, |cb| {
+                // TODO: use look up??
+                cb.require_in_set(
+                    "txlist header in [0xf8,0xf9,0xfa]",
+                    byte_cells_cur[0].expr(),
+                    vec![192.expr(), 248.expr(), 249.expr(), 250.expr()],
+                );
+
+                cb.require_equal(
+                    "rlp_tag_length = rlp_header length",
+                    rlp_tag_length_cur.expr(),
+                    byte_cells_cur[0].expr() - 247.expr() + 1.expr(),
+                );
+            });
+
+            cb.require_equal(
+                "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
+                acc_rlc_cur,
+                r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
+                    + rlc::expr(&byte_cells_cur, args.challenges.keccak_input()),
+            );
+
+            cb.gate(q_first)
+        });
+
+        meta.create_gate("txHeader", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            let tx_id_cur = meta.query_advice(tx_id, Rotation::cur());
+            let tx_id_prev = meta.query_advice(tx_id, Rotation::prev());
+            let tx_type_cur = meta.query_advice(tx_type, Rotation::cur());
+            let tag_cur = meta.query_advice(tag, Rotation::cur());
+            let tag_next = meta.query_advice(tag, Rotation::next());
+            let complete = meta.query_advice(complete, Rotation::cur());
+            let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
+            let r_mult = meta.query_advice(r_mult, Rotation::cur());
+            let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
+            let value = meta.query_advice(value, Rotation::cur());
+            let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
+            let byte_cells_cur = bytes
+                .iter()
+                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
+                .collect::<Vec<_>>();
+            let decodable = meta.query_advice(decodable, Rotation::cur());
+            let valid = meta.query_advice(valid, Rotation::cur());
+            let q_fields = q_fields
+                .iter()
+                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
+                .collect::<Vec<_>>();
+
+            cb.require_equal(
+                "tx_id == tx_id_prev + 1",
+                tx_id_cur.expr(),
+                tx_id_prev.expr() + 1.expr(),
+            );
+            cb.require_zero("legacy tx_type", tx_type_cur.expr());
+            cb.require_equal(
+                "tag is tx header",
+                tag_cur,
+                RlpTxFieldTag::TxRlpHeader.expr(),
+            );
+            cb.require_equal("field completed", complete.expr(), 1.expr());
+
+            // next should be nonce if legacy(0) or chain_id if 1559
+            cb.condition(not::expr(tx_type_cur.expr()), |cb| {
+                let tx_type_next = meta.query_advice(tx_type, Rotation::next());
+                cb.require_equal(
+                    "next tx is legacy",
+                    tx_type_next,
+                    RlpTxTypeTag::TxLegacyType.expr(),
+                );
+                cb.require_equal("next field is nonce", tag_next, RlpTxFieldTag::Nonce.expr());
+            });
+
             cb.condition(decodable, |cb| {
                 // TODO: use look up??
                 cb.require_in_set(
                     "list header in [0xf8,0xf9,0xfa]",
-                    bytes[0].expr(),
+                    byte_cells_cur[0].expr(),
                     vec![248.expr(), 249.expr(), 250.expr()],
-                )
+                );
+
+                cb.require_equal(
+                    "rlp_tag_length = rlp_header length",
+                    rlp_tag_length_cur.expr(),
+                    byte_cells_cur[0].expr() - 247.expr() + 1.expr(),
+                );
             });
 
-            cb.gate(q_first)
+            cb.require_equal(
+                "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
+                acc_rlc_cur,
+                r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
+                    + rlc::expr(&byte_cells_cur, args.challenges.keccak_input()),
+            );
+
+            cb.gate(q_fields[RlpTxFieldTag::TxRlpHeader].expr() * meta.query_selector(q_enable))
         });
 
         // Nonce
@@ -438,13 +729,9 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 RlpTxFieldTag::GasPrice.expr(),
             );
 
-            cb.require_equal(
-                "decodable if not null",
-                decodable,
-                not::expr(rlp_types[RlpDecodeTypeTag::NullValue].expr()),
-            );
+            // TODO: decodable == 0 < bytes[0] <= 0x88, using lookup??
+            // i.e., lookup nonce rlp_type table, should be single or short
 
-            // TODO: lookup nonce rlp_type table, should be single or short
             cb.gate(q_fields[RlpTxFieldTag::Nonce].expr() * meta.query_selector(q_enable))
         });
 
@@ -548,11 +835,13 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             );
 
             // TODO: Lookup fix length 0xa0/0x80
-            cb.require_in_set(
-                "0xa0 or 0x80",
-                bytes[0].expr(),
-                vec![160.expr(), 128.expr()],
-            );
+            cb.condition(decodable.expr(), |cb| {
+                cb.require_in_set(
+                    "0x94 or 0x80",
+                    bytes[0].expr(),
+                    vec![148.expr(), 128.expr()],
+                );
+            });
 
             cb.gate(q_fields[RlpTxFieldTag::To].expr() * meta.query_selector(q_enable))
         });
@@ -601,12 +890,13 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 .collect::<Vec<_>>();
 
             cb.require_equal("tag", tag_cur, RlpTxFieldTag::Data.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-            cb.require_equal(
-                "next field is SignV",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::SignV.expr(),
-            );
+            cb.condition(complete, |cb| {
+                cb.require_equal(
+                    "next field is SignV",
+                    meta.query_advice(tag, Rotation::next()),
+                    RlpTxFieldTag::SignV.expr(),
+                );
+            });
 
             cb.gate(q_fields[RlpTxFieldTag::Data].expr() * meta.query_selector(q_enable))
         });
@@ -657,11 +947,13 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_equal("tag", tag_cur, RlpTxFieldTag::SignR.expr());
             cb.require_equal("field completed", complete.expr(), 1.expr());
 
-            cb.require_equal(
-                "decodable if valid rlp header",
-                not::expr(decodable),
-                bytes[0].expr() - 0xa0.expr(),
-            );
+            cb.condition(decodable.expr(), |cb| {
+                cb.require_equal(
+                    "decodable if valid rlp header",
+                    bytes[0].expr(),
+                    0xa0.expr(),
+                )
+            });
 
             // next is signS
             cb.require_equal(
@@ -695,7 +987,10 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_in_set(
                 "next field is Nonce or Padding",
                 meta.query_advice(tag, Rotation::next()),
-                vec![RlpTxFieldTag::Nonce.expr(), RlpTxFieldTag::Padding.expr()],
+                vec![
+                    RlpTxFieldTag::TxRlpHeader.expr(),
+                    RlpTxFieldTag::Padding.expr(),
+                ],
             );
 
             cb.gate(q_fields[RlpTxFieldTag::SignS].expr() * meta.query_selector(q_enable))
@@ -726,14 +1021,18 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_equal("tag", tag_cur, RlpTxFieldTag::Padding.expr());
             cb.require_equal("field completed", complete.expr(), 1.expr());
             // next is a new tx or padding
-            cb.require_in_set(
-                "next field is Padding or next tx nonce",
+            cb.require_equal(
+                "next field is Padding",
                 meta.query_advice(tag, Rotation::next()),
-                vec![RlpTxFieldTag::Nonce.expr(), RlpTxFieldTag::Padding.expr()],
+                RlpTxFieldTag::Padding.expr(),
             );
-            cb.require_equal("padding has no r_mult", r_mult, 0.expr());
-            cb.require_equal("padding has no length", length, 0.expr());
-            cb.require_equal("padding has no remain length", remain_length, 0.expr());
+            cb.require_zero("padding has no r_mult", r_mult);
+            cb.require_zero("padding has no length", length);
+            cb.require_zero("padding has no remain length", remain_length);
+            cb.require_zero(
+                "last row above padding has no remain length",
+                meta.query_advice(rlp_remain_length, Rotation::prev()),
+            );
             cb.require_equal("padding has no rlc (all 0)", acc_rlc_value, 0.expr());
 
             cb.gate(
@@ -797,13 +1096,166 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 }
 
 impl<F: Field> RlpDecoderCircuitConfig<F> {
+    fn assign_rows(
+        &self,
+        region: &mut Region<'_, F>,
+        offset: usize,
+        wits: &[RlpDecoderCircuitConfigWitness<F>],
+    ) -> Result<(), Error> {
+        let mut offset = offset;
+        self.name_row_members(region);
+        for wit in wits {
+            self.assign_row(region, offset, wit)?;
+            offset += 1;
+        }
+        Ok(())
+    }
+
+    fn name_row_members(&self, region: &mut Region<'_, F>) {
+        region.name_column(|| "config.tx_id", self.tx_id);
+        region.name_column(|| "config.tx_type", self.tx_type);
+        region.name_column(|| "config.tag", self.tag);
+        region.name_column(|| "config.complete", self.complete);
+        for (i, rlp_type) in self.rlp_types.iter().enumerate() {
+            region.name_column(|| format!("config.rlp_types[{}]", i), *rlp_type);
+        }
+        region.name_column(|| "config.rlp_tag_length", self.rlp_tag_length);
+        region.name_column(|| "config.rlp_remain_length", self.rlp_remain_length);
+        region.name_column(|| "config.r_mult", self.r_mult);
+        region.name_column(|| "config.value", self.value);
+        region.name_column(|| "config.acc_rlc_value", self.acc_rlc_value);
+        for (i, byte) in self.bytes.iter().enumerate() {
+            region.name_column(|| format!("config.bytes-[{}]", i), *byte);
+        }
+        region.name_column(|| "config.decodable", self.decodable);
+        region.name_column(|| "config.valid", self.valid);
+    }
+
     fn assign_row(
         &self,
         region: &mut Region<'_, F>,
         offset: usize,
-        value: u8,
-    ) -> Result<AssignedCell<F, F>, Error> {
-        todo!()
+        w: &RlpDecoderCircuitConfigWitness<F>,
+    ) -> Result<(), Error> {
+        region.assign_advice(
+            || "config.tx_id",
+            self.tx_id,
+            offset,
+            || Value::known(F::from(w.tx_id)),
+        )?;
+        region.assign_advice(
+            || "config.tx_type",
+            self.tx_type,
+            offset,
+            || Value::known(F::from(w.tx_type as u64)),
+        )?;
+        region.assign_advice(
+            || "config.tag",
+            self.tag,
+            offset,
+            || Value::known(F::from(w.tag as u64)),
+        )?;
+        region.assign_advice(
+            || "config.complete",
+            self.complete,
+            offset,
+            || Value::known(F::from(w.complete)),
+        )?;
+        for (i, rlp_type) in self.rlp_types.iter().enumerate() {
+            region.assign_advice(
+                || format!("config.rlp_types[{}]", i),
+                *rlp_type,
+                offset,
+                || Value::known(F::from(w.rlp_types[i])),
+            )?;
+        }
+        region.assign_advice(
+            || "config.rlp_tag_length",
+            self.rlp_tag_length,
+            offset,
+            || Value::known(F::from(w.rlp_tag_length)),
+        )?;
+        region.assign_advice(
+            || "config.tag_bytes_in_row",
+            self.tag_bytes_in_row,
+            offset,
+            || Value::known(F::from(w.tag_bytes_in_row as u64)),
+        )?;
+        region.assign_advice(
+            || "config.r_mult",
+            self.r_mult,
+            offset,
+            || Value::known(F::from(w.r_mult)),
+        )?;
+        region.assign_advice(
+            || "config.rlp_remain_length",
+            self.rlp_remain_length,
+            offset,
+            || Value::known(F::from(w.rlp_remain_length as u64)),
+        )?;
+        region.assign_advice(
+            || "config.value",
+            self.value,
+            offset,
+            || Value::known(F::from(w.value)),
+        )?;
+        region.assign_advice(
+            || "config.acc_rlc_value",
+            self.acc_rlc_value,
+            offset,
+            || Value::known(F::from(w.acc_rlc_value)),
+        )?;
+        for (i, byte) in self.bytes.iter().enumerate() {
+            region.assign_advice(
+                || format!("config.bytes[{}]", i),
+                *byte,
+                offset,
+                || {
+                    if i < w.bytes.len() {
+                        Value::known(F::from(w.bytes[i] as u64))
+                    } else {
+                        Value::known(F::zero())
+                    }
+                },
+            )?;
+        }
+        region.assign_advice(
+            || "config.decodable",
+            self.decodable,
+            offset,
+            || Value::known(F::from(w.decodable)),
+        )?;
+        region.assign_advice(
+            || "config.valid",
+            self.valid,
+            offset,
+            || Value::known(F::from(w.valid)),
+        )?;
+        for (i, q_field) in self.q_fields.iter().enumerate() {
+            region.assign_advice(
+                || format!("config.q_fields[{}]", i),
+                *q_field,
+                offset,
+                || Value::known(F::from(w.q_fields[i])),
+            )?;
+        }
+        region.assign_fixed(
+            || "config.q_first",
+            self.q_first,
+            offset,
+            || Value::known(F::from(w.q_first)),
+        )?;
+        region.assign_fixed(
+            || "config.q_last",
+            self.q_last,
+            offset,
+            || Value::known(F::from(w.q_last)),
+        )?;
+        if w.q_enable {
+            self.q_enable.enable(region, offset)?;
+        }
+
+        Ok(())
     }
 
     /// Get number of rows required.
@@ -815,31 +1267,51 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
 /// rlp decode Circuit for verifying transaction signatures
 #[derive(Clone, Default, Debug)]
 pub struct RlpDecoderCircuit<F: Field> {
-    /// Max number of supported transactions
-    pub max_txs: usize,
-    /// Max number of supported calldata bytes
-    pub max_calldata: usize,
     /// input bytes
     pub bytes: Vec<u8>,
+    /// Size of the circuit
+    pub size: usize,
     /// phantom
-    pub _marker: std::marker::PhantomData<F>,
+    pub _marker: PhantomData<F>,
 }
 
 impl<F: Field> RlpDecoderCircuit<F> {
     /// Return a new RlpDecoderCircuit
-    pub fn new(max_txs: usize, max_calldata: usize, bytes: Vec<u8>) -> Self {
+    pub fn new(bytes: Vec<u8>, degree: usize) -> Self {
         RlpDecoderCircuit::<F> {
-            max_txs,
-            max_calldata,
             bytes,
-            _marker: std::marker::PhantomData,
+            size: 1 << degree,
+            _marker: PhantomData,
         }
     }
 
     /// Return the minimum number of rows required to prove an input of a
     /// particular size.
-    pub fn min_num_rows(txs_len: usize, call_data_len: usize) -> usize {
-        0
+    pub fn min_num_rows(block: &witness::Block<F>) -> (usize, usize) {
+        let txs_len = block.txs.len();
+        let call_data_rows = block.txs.iter().fold(0, |acc, tx| {
+            acc + tx.call_data.len() / MAX_BYTE_COLUMN_NUM + 1
+        });
+
+        let min_num_rows = Self::calc_min_num_rows(txs_len, call_data_rows);
+        (min_num_rows, min_num_rows)
+    }
+
+    /// Return the minimum number of rows required to prove an input of a
+    /// particular size.
+    pub fn min_num_rows_from_tx(txs: &Vec<Transaction>) -> (usize, usize) {
+        let txs_len = txs.len();
+        let call_data_rows = txs
+            .iter()
+            .fold(0, |acc, tx| acc + tx.input.len() / MAX_BYTE_COLUMN_NUM + 1);
+
+        let min_num_rows = Self::calc_min_num_rows(txs_len, call_data_rows);
+        (min_num_rows, min_num_rows)
+    }
+
+    fn calc_min_num_rows(txs_len: usize, call_data_rows: usize) -> usize {
+        // add 2 for prev and next rotations.
+        txs_len * LEGACY_TX_FIELD_NUM + call_data_rows + NUM_BLINDING_ROWS + 2
     }
 }
 
@@ -847,25 +1319,24 @@ impl<F: Field> SubCircuit<F> for RlpDecoderCircuit<F> {
     type Config = RlpDecoderCircuitConfig<F>;
 
     fn new_from_block(block: &witness::Block<F>) -> Self {
-        Self::new(
-            block.circuits_params.max_txs,
-            block.circuits_params.max_calldata,
-            Vec::<u8>::new(),
-        )
+        let txs: Vec<SignedTransaction> = block
+            .eth_block
+            .transactions
+            .iter()
+            .map(|tx| tx.into())
+            .collect::<Vec<_>>();
+        let bytes = rlp::encode_list(&txs).to_vec();
+        let degree = log2_ceil(Self::min_num_rows(block).0);
+        RlpDecoderCircuit::<F> {
+            bytes,
+            size: 1 << degree,
+            _marker: PhantomData,
+        }
     }
 
     /// Return the minimum number of rows required to prove the block
     fn min_num_rows_block(block: &witness::Block<F>) -> (usize, usize) {
-        (
-            Self::min_num_rows(
-                block.txs.len(),
-                block.txs.iter().map(|tx| tx.call_data.len()).sum(),
-            ),
-            Self::min_num_rows(
-                block.circuits_params.max_txs,
-                block.circuits_params.max_calldata,
-            ),
-        )
+        RlpDecoderCircuit::<F>::min_num_rows(block)
     }
 
     /// Make the assignments to the RlpDecodeCircuit
@@ -875,12 +1346,27 @@ impl<F: Field> SubCircuit<F> for RlpDecoderCircuit<F> {
         challenges: &Challenges<Value<F>>,
         layouter: &mut impl Layouter<F>,
     ) -> Result<(), Error> {
-        Ok(())
+        let mut randomness = F::zero();
+        challenges.keccak_input().map(|r| randomness = r);
+        let witness: Vec<RlpDecoderCircuitConfigWitness<F>> =
+            rlp_decode_tx_list_manually(&self.bytes, randomness, self.size as u32);
+
+        // for iw in witness.iter().take(100).enumerate() {
+        //     println!("witness[{}] {:?}", iw.0, iw.1);
+        // }
+
+        layouter.assign_region(
+            || "rlp witness region",
+            |mut region| {
+                let offset = 0;
+                config.assign_rows(&mut region, offset, &witness)?;
+                Ok(())
+            },
+        )
     }
 
     fn instance(&self) -> Vec<Vec<F>> {
-        // The maingate expects an instance column, but we don't use it, so we return an
-        // "empty" instance column
+        // empty instance now
         vec![vec![]]
     }
 }
@@ -900,13 +1386,15 @@ impl<F: Field> Circuit<F> for RlpDecoderCircuit<F> {
         let challenges = Challenges::construct(meta);
 
         let config = {
-            let challenges = challenges.exprs(meta);
+            // let challenges_expr = challenges.exprs(meta);
+            let r = 11u64;
+            let challenges_expr = Challenges::mock(r.expr(), r.expr(), r.expr());
             RlpDecoderCircuitConfig::new(
                 meta,
                 RlpDecoderCircuitConfigArgs {
                     tx_table,
                     keccak_table,
-                    challenges,
+                    challenges: challenges_expr,
                 },
             )
         };
@@ -916,54 +1404,461 @@ impl<F: Field> Circuit<F> for RlpDecoderCircuit<F> {
 
     fn synthesize(
         &self,
-        (config, challenges): Self::Config,
+        (config, _challenges): Self::Config,
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
-        Ok(())
+        // let challenges = challenges.values(&mut layouter);
+        let r = F::from(11u64);
+        let challenges = Challenges::mock(Value::known(r), Value::known(r), Value::known(r));
+
+        self.synthesize_sub(&config, &challenges, &mut layouter)
     }
 }
 
-trait RlpWitness {
-    fn generate_rlp_decoded_witness(&self) -> Vec<u8>;
-}
-
-impl RlpWitness for Transaction {
-    fn generate_rlp_decoded_witness(&self) -> Vec<u8> {
-        // TODO: use offset to split the input bytes
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(rlp::encode(&self.nonce).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.gas_price).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.gas).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.to).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.value).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.input.as_ref()).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.v).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.r).as_ref());
-        bytes.extend_from_slice(rlp::encode(&self.s).as_ref());
-        bytes
-    }
-}
-
-fn rlp_decode(bytes: Vec<u8>) -> Result<Vec<u8>, Error> {
-    match rlp::Rlp::new(&bytes).as_list::<Transaction>() {
-        Ok(txlist) => {
-            // TODO: check txs.len() <= max_txs
-            let mut bytes = Vec::new();
-            for tx in txlist {
-                let witness = tx.generate_rlp_decoded_witness();
-                bytes.extend_from_slice(&witness)
-            }
-            Ok(bytes)
+fn generate_rlp_type_witness(
+    header_byte: u8,
+) -> ([bool; RlpDecodeTypeTag::RlpDecodeTypeNum as usize], bool) {
+    let mut rlp_types = [false; RlpDecodeTypeTag::RlpDecodeTypeNum as usize];
+    let mut decodable = true;
+    match header_byte {
+        0x00..=0x7f => {
+            rlp_types[RlpDecodeTypeTag::SingleByte as usize] = true;
         }
-        Err(e) => rlp_decode_tx_list_manually(&bytes),
+        0x80 => {
+            rlp_types[RlpDecodeTypeTag::NullValue as usize] = true;
+        }
+        0x81..=0xb7 => {
+            rlp_types[RlpDecodeTypeTag::ShortString as usize] = true;
+        }
+        0xb8 => {
+            rlp_types[RlpDecodeTypeTag::LongString1 as usize] = true;
+        }
+        0xb9 => {
+            rlp_types[RlpDecodeTypeTag::LongString2 as usize] = true;
+        }
+        0xba => {
+            rlp_types[RlpDecodeTypeTag::LongString3 as usize] = true;
+        }
+        0xc0 => {
+            rlp_types[RlpDecodeTypeTag::EmptyList as usize] = true;
+        }
+        0xc1..=0xf7 => {
+            rlp_types[RlpDecodeTypeTag::ShortList as usize] = true;
+        }
+        0xf8 => {
+            rlp_types[RlpDecodeTypeTag::LongList1 as usize] = true;
+        }
+        0xf9 => {
+            rlp_types[RlpDecodeTypeTag::LongList2 as usize] = true;
+        }
+        0xfa => {
+            rlp_types[RlpDecodeTypeTag::LongList3 as usize] = true;
+        }
+        _ => {
+            decodable = false;
+        }
+    }
+    (rlp_types, decodable)
+}
+
+fn generate_q_fields_witness(tag: &RlpTxFieldTag) -> [bool; LEGACY_TX_FIELD_NUM as usize] {
+    let mut q_fields = [false; LEGACY_TX_FIELD_NUM as usize];
+    q_fields[*tag as usize] = true;
+    if tag > &RlpTxFieldTag::Padding {
+        unreachable!("1559 not support now")
+    }
+    q_fields
+}
+
+fn generate_fields_witness_len(tag: &RlpTxFieldTag, payload: &PayloadInfo) -> usize {
+    match tag {
+        RlpTxFieldTag::TxListRlpHeader => payload.header_len,
+        RlpTxFieldTag::TxRlpHeader => payload.header_len,
+        _ => payload.total(),
     }
 }
 
-fn rlp_decode_tx_list_manually(bytes: &Vec<u8>) -> Result<Vec<u8>, Error> {
-    let mut bytes = Vec::new();
-    bytes.push(0xc8); // empty []
+fn generate_rlp_row_witness<F: Field>(
+    tx_id: u64,
+    tag: &RlpTxFieldTag,
+    raw_bytes: &[u8],
+    r: F,
+    rlp_remain_length: usize,
+) -> Vec<RlpDecoderCircuitConfigWitness<F>> {
+    let mut witness = vec![];
+    let (mut rlp_types, decodable) = generate_rlp_type_witness(raw_bytes[0]);
+    let partial_rlp_types = {
+        let mut tmp = [false; RlpDecodeTypeTag::RlpDecodeTypeNum as usize];
+        tmp[RlpDecodeTypeTag::PartialRlp as usize] = true;
+        tmp
+    };
+    let q_fields = generate_q_fields_witness(tag);
+    let rlp_tag_len = raw_bytes.len();
+    let mut prev_rlp_remain_length = rlp_remain_length;
 
-    Ok(bytes)
+    macro_rules! generate_witness {
+        () => {{
+            let mut temp_witness_vec = Vec::new();
+            let mut tag_remain_length = rlp_tag_len;
+            let mut raw_bytes_offset = 0;
+            while tag_remain_length > MAX_BYTE_COLUMN_NUM {
+                temp_witness_vec.push(RlpDecoderCircuitConfigWitness::<F> {
+                    tx_id: tx_id,
+                    tx_type: RlpTxTypeTag::TxLegacyType,
+                    tag: tag.clone(),
+                    complete: false,
+                    rlp_types: rlp_types,
+                    rlp_tag_length: tag_remain_length as u64,
+                    tag_bytes_in_row: MAX_BYTE_COLUMN_NUM as u8,
+                    r_mult: r.pow(&[MAX_BYTE_COLUMN_NUM as u64, 0, 0, 0]),
+                    rlp_remain_length: prev_rlp_remain_length - MAX_BYTE_COLUMN_NUM,
+                    value: F::zero(),
+                    acc_rlc_value: F::zero(),
+                    bytes: raw_bytes[..MAX_BYTE_COLUMN_NUM].to_vec(),
+                    decodable: decodable,
+                    valid: true,
+                    q_fields: q_fields,
+                    q_enable: true,
+                    q_first: false,
+                    q_last: false,
+                });
+                raw_bytes_offset += MAX_BYTE_COLUMN_NUM;
+                tag_remain_length -= MAX_BYTE_COLUMN_NUM;
+                prev_rlp_remain_length -= MAX_BYTE_COLUMN_NUM;
+                rlp_types = partial_rlp_types;
+            }
+            temp_witness_vec.push(RlpDecoderCircuitConfigWitness::<F> {
+                tx_id: tx_id,
+                tx_type: RlpTxTypeTag::TxLegacyType,
+                tag: tag.clone(),
+                complete: true,
+                rlp_types: rlp_types,
+                rlp_tag_length: tag_remain_length as u64,
+                tag_bytes_in_row: tag_remain_length as u8,
+                r_mult: r.pow(&[tag_remain_length as u64, 0, 0, 0]),
+                rlp_remain_length: prev_rlp_remain_length - tag_remain_length,
+                value: F::zero(),
+                acc_rlc_value: F::zero(),
+                bytes: raw_bytes[raw_bytes_offset..].to_vec(),
+                decodable: decodable,
+                valid: true,
+                q_fields: q_fields,
+                q_enable: true,
+                q_first: false,
+                q_last: false,
+            });
+            temp_witness_vec
+        }};
+    }
+
+    // TODO: reorganize the match
+    match tag {
+        RlpTxFieldTag::TxListRlpHeader => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::TxRlpHeader => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::Nonce => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::GasPrice => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::Gas => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::To => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::Value => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::Data => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::SignV => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::SignR => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::SignS => witness.append(&mut generate_witness!()),
+        RlpTxFieldTag::Padding => {
+            unreachable!("Padding should not be here")
+        }
+        _ => {
+            unreachable!("1559 not support now")
+        }
+    }
+    witness
+}
+
+fn generate_rlp_txfield_witness<F: Field>(
+    tx_id: u64,
+    tag: &RlpTxFieldTag,
+    bytes: &[u8],
+    r: F,
+    witness: &mut Vec<RlpDecoderCircuitConfigWitness<F>>,
+) -> Option<PayloadInfo> {
+    let offset = 0;
+    let decode_result = PayloadInfo::from(&bytes[offset..]);
+
+    match decode_result {
+        Ok(payload_info) => {
+            let bytes_num = generate_fields_witness_len(tag, &payload_info);
+            let rlp_remain_length = witness
+                .last()
+                .map_or(payload_info.total(), |w| w.rlp_remain_length);
+
+            witness.append(&mut generate_rlp_row_witness(
+                tx_id,
+                tag,
+                &bytes[offset..offset + bytes_num],
+                r,
+                rlp_remain_length,
+            ));
+            Some(payload_info)
+        }
+        // TODO: error case
+        Err(decoder_err) => match decoder_err {
+            rlp::DecoderError::RlpIsTooShort => todo!(),
+            rlp::DecoderError::RlpDataLenWithZeroPrefix => todo!(),
+            rlp::DecoderError::RlpInvalidIndirection => todo!(),
+            _ => unimplemented!("Unsupport payload decode error: {:?}", decoder_err),
+        },
+    }
+}
+
+// trait RlpTxFieldWittnessGenerator<F: Field> {
+//     fn generate_rlp_txfield_witness(
+//         &self,
+//         tx_id: u64,
+//         bytes: &[u8],
+//         r: F,
+//         witness: &mut Vec<RlpDecoderCircuitConfigWitness<F>>,
+//     ) -> Option<PayloadInfo>;
+// }
+
+// impl<F: Field> RlpTxFieldWittnessGenerator<F> for RlpTxFieldTag {
+//     fn generate_rlp_txfield_witness(
+//         &self,
+//         tx_id: u64,
+//         bytes: &[u8],
+//         r: F,
+//         witness: &mut Vec<RlpDecoderCircuitConfigWitness<F>>,
+//     ) -> Option<PayloadInfo> {
+//         let offset = 0;
+//         let decode_result = PayloadInfo::from(&bytes[offset..]);
+//         match self {
+//             RlpTxFieldTag::TxListRlpHeader => todo!(),
+//             RlpTxFieldTag::TxRlpHeader => todo!(),
+//             RlpTxFieldTag::Nonce => todo!(),
+//             RlpTxFieldTag::GasPrice => todo!(),
+//             RlpTxFieldTag::Gas => todo!(),
+//             RlpTxFieldTag::To => todo!(),
+//             RlpTxFieldTag::Value => todo!(),
+//             RlpTxFieldTag::Data => todo!(),
+//             RlpTxFieldTag::SignV => todo!(),
+//             RlpTxFieldTag::SignR => todo!(),
+//             RlpTxFieldTag::SignS => todo!(),
+//             RlpTxFieldTag::Padding => todo!(),
+//             RlpTxFieldTag::ChainID => todo!(),
+//             RlpTxFieldTag::GasTipCap => todo!(),
+//             RlpTxFieldTag::GasFeeCap => todo!(),
+//             RlpTxFieldTag::AccessList => todo!(),
+//         }
+//     }
+// }
+
+// TODO: use a state machine to decode the tx list as above
+fn rlp_decode_tx_list_manually<F: Field>(
+    bytes: &[u8],
+    r: F,
+    k: u32,
+) -> Vec<RlpDecoderCircuitConfigWitness<F>> {
+    let mut witness = vec![];
+    let mut tx_id: u64 = 0;
+
+    let mut offset = 0;
+    let tx_list_header = generate_rlp_txfield_witness(
+        tx_id,
+        &RlpTxFieldTag::TxListRlpHeader,
+        &bytes[offset..],
+        r,
+        &mut witness,
+    );
+    if tx_list_header.is_none() {
+        return witness;
+    }
+    let tx_list_rlp_header = tx_list_header.unwrap();
+    offset += tx_list_rlp_header.header_len;
+
+    let total_list_len = tx_list_rlp_header.total();
+    tx_id = 1; // tx_id started from 1 as we have a Anchor tx
+    while offset < total_list_len {
+        let tx_rlp_header = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::TxRlpHeader,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_header.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_header.unwrap().header_len;
+
+        let tx_rlp_nonce = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::Nonce,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_nonce.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_nonce.unwrap().total();
+
+        let tx_rlp_gas_price = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::GasPrice,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_gas_price.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_gas_price.unwrap().total();
+
+        let tx_rlp_gas = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::Gas,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_gas.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_gas.unwrap().total();
+
+        let tx_rlp_to_addr = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::To,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_to_addr.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_to_addr.unwrap().total();
+
+        let tx_rlp_value = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::Value,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_value.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_value.unwrap().total();
+
+        let tx_rlp_data = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::Data,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_data.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_data.unwrap().total();
+
+        let tx_rlp_v = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::SignV,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_v.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_v.unwrap().total();
+
+        let tx_rlp_r = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::SignR,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_r.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_r.unwrap().total();
+
+        let tx_rlp_s = generate_rlp_txfield_witness(
+            tx_id,
+            &RlpTxFieldTag::SignS,
+            &bytes[offset..],
+            r,
+            &mut witness,
+        );
+        if tx_rlp_s.is_none() {
+            return witness;
+        }
+        offset += tx_rlp_s.unwrap().total();
+        tx_id += 1;
+    }
+
+    assert!(offset == total_list_len);
+    fixup_acc_rlc(&mut witness, r);
+
+    let witness_len = witness.len();
+    assert!(k > (witness_len + 2 + NUM_BLINDING_ROWS) as u32);
+    complete_paddings(
+        &mut witness,
+        k as usize - witness_len - 2 - NUM_BLINDING_ROWS,
+    )
+}
+
+fn fixup_acc_rlc<F: Field>(witness: &mut Vec<RlpDecoderCircuitConfigWitness<F>>, randomness: F) {
+    let mut rev_iter = witness.iter_mut().rev();
+    let mut prev: Option<&mut RlpDecoderCircuitConfigWitness<F>> = None;
+    while let Some(current_witness) = rev_iter.next() {
+        let prev_acc_rlc_value =
+            prev.map_or(F::zero(), |w| w.acc_rlc_value * current_witness.r_mult);
+        current_witness.acc_rlc_value =
+            prev_acc_rlc_value + rlc::value(&current_witness.bytes, randomness);
+
+        prev = Some(current_witness);
+    }
+}
+fn complete_paddings<F: Field>(
+    witness: &mut Vec<RlpDecoderCircuitConfigWitness<F>>,
+    num_padding_to_last_row: usize,
+) -> Vec<RlpDecoderCircuitConfigWitness<F>> {
+    let mut complete_witness = vec![];
+    let mut pre_padding = RlpDecoderCircuitConfigWitness::<F>::default();
+    pre_padding.rlp_remain_length =
+        witness[0].rlp_remain_length + witness[0].tag_bytes_in_row as usize;
+
+    complete_witness.push(pre_padding);
+    witness[0].q_first = true;
+    complete_witness.append(witness);
+
+    for i in 0..num_padding_to_last_row {
+        complete_witness.push(RlpDecoderCircuitConfigWitness::<F> {
+            tx_id: 0,
+            tx_type: RlpTxTypeTag::TxLegacyType,
+            tag: RlpTxFieldTag::Padding,
+            complete: true,
+            rlp_types: [false; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
+            rlp_tag_length: 0,
+            tag_bytes_in_row: 0,
+            r_mult: F::zero(),
+            rlp_remain_length: 0,
+            value: F::zero(),
+            acc_rlc_value: F::zero(),
+            bytes: [0; MAX_BYTE_COLUMN_NUM].to_vec(),
+            decodable: true,
+            valid: true,
+            q_fields: [false; LEGACY_TX_FIELD_NUM as usize],
+            q_enable: true,
+            q_first: false,
+            q_last: i == num_padding_to_last_row - 1,
+        });
+    }
+    complete_witness.push(RlpDecoderCircuitConfigWitness::<F>::default());
+    complete_witness
 }
 
 /// Signed transaction in a witness block
@@ -1057,11 +1952,31 @@ impl From<MockTransaction> for SignedTransaction {
 
 #[cfg(test)]
 mod rlp_test {
-    use super::SignedTransaction;
+    use super::{rlp_decode_tx_list_manually, SignedTransaction};
     use ethers_core::utils::rlp;
+    use halo2_proofs::halo2curves::bn256::Fr;
     use hex;
+    use mock::AddrOrWallet;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+
+    fn prepare_legacy_txlist_rlp_bytes(txs_num: usize) -> Vec<u8> {
+        // let tx: SignedTransaction = mock::CORRECT_MOCK_TXS[1].clone().into();
+        // let rlp_tx = rlp::encode(&tx);
+        // println!("{:?}", hex::encode(rlp_tx));
+
+        let txs: Vec<SignedTransaction> = vec![mock::CORRECT_MOCK_TXS[0].clone().into(); txs_num];
+        let rlp_txs = rlp::encode_list(&txs);
+        println!("rlp_txs = {:?}", hex::encode(rlp_txs.clone()));
+
+        let rlp_bytes = rlp_txs.to_vec();
+        println!("rlp_bytes = {:?}", hex::encode(&rlp_bytes));
+        rlp_bytes
+    }
+
+    fn prepare_eip1559_txlist_rlp_bytes() -> Vec<u8> {
+        todo!()
+    }
 
     #[test]
     fn test_decode() {
@@ -1100,34 +2015,93 @@ mod rlp_test {
         let rlp_tx = rlp::encode(&tx);
         println!("{:?}", hex::encode(rlp_tx));
     }
+
+    #[test]
+    fn test_correct_witness_generation_empty_list() {
+        let rlp_bytes = prepare_legacy_txlist_rlp_bytes(0);
+        let randomness = Fr::from(100);
+        let k = 128;
+
+        let witness = rlp_decode_tx_list_manually::<Fr>(&rlp_bytes, randomness, k);
+        for (i, w) in witness.iter().enumerate() {
+            print!("witness[{}] = {:?}\n", i, w);
+        }
+    }
+
+    #[test]
+    fn test_correct_witness_generation_1tx() {
+        let rlp_bytes = prepare_legacy_txlist_rlp_bytes(1);
+        let randomness = Fr::from(100);
+        let k = 128;
+
+        let witness = rlp_decode_tx_list_manually::<Fr>(&rlp_bytes, randomness, k);
+        for (i, w) in witness.iter().enumerate() {
+            print!("witness[{}] = {:?}\n", i, w);
+        }
+    }
+
+    #[test]
+    fn test_correct_witness_generation_11tx() {
+        let rlp_bytes = prepare_legacy_txlist_rlp_bytes(11);
+        let randomness = Fr::from(100);
+        let k = 256;
+
+        let witness = rlp_decode_tx_list_manually::<Fr>(&rlp_bytes, randomness, k);
+        for (i, w) in witness.iter().enumerate() {
+            print!("witness[{}] = {:?}\n", i, w);
+        }
+    }
+
+    #[test]
+    fn test_correct_witness_generation_big_data() {
+        let mut rng = ChaCha20Rng::seed_from_u64(2u64);
+        let tx: SignedTransaction = mock::MockTransaction::default()
+            .from(AddrOrWallet::random(&mut rng))
+            .input(eth_types::Bytes::from(
+                (0..55).map(|v| v as u8).collect::<Vec<u8>>(),
+            ))
+            .build()
+            .into();
+
+        let rlp_txs = rlp::encode_list(&[tx]);
+        println!("rlp_txs = {:?}", hex::encode(rlp_txs.clone()));
+        let randomness = Fr::from(100);
+        let k = 256;
+
+        let witness = rlp_decode_tx_list_manually::<Fr>(&rlp_txs.to_vec(), randomness, k);
+        for (i, w) in witness.iter().enumerate() {
+            print!("witness[{}] = {:?}\n", i, w);
+        }
+    }
+
+    #[test]
+    fn test_wrong_witness_generation() {
+        todo!()
+    }
 }
 
 #[cfg(test)]
 mod rlp_decode_circuit_tests {
     use super::*;
     use crate::util::log2_ceil;
-    use eth_types::address;
     use halo2_proofs::{
         dev::{MockProver, VerifyFailure},
         halo2curves::bn256::Fr,
     };
     use mock::AddrOrWallet;
     use pretty_assertions::assert_eq;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
 
-    const NUM_BLINDING_ROWS: usize = 64;
+    fn run<F: Field>(txs: Vec<Transaction>) -> Result<(), Vec<VerifyFailure>> {
+        let k = log2_ceil(RlpDecoderCircuit::<Fr>::min_num_rows_from_tx(&txs).0);
 
-    fn run<F: Field>(
-        txs: Vec<Transaction>,
-        chain_id: u64,
-        max_txs: usize,
-        max_calldata: usize,
-    ) -> Result<(), Vec<VerifyFailure>> {
-        let k = log2_ceil(
-            NUM_BLINDING_ROWS + RlpDecoderCircuit::<Fr>::min_num_rows(max_txs, max_calldata),
-        );
-        // SignVerifyChip -> ECDSAChip -> MainGate instance column
-        let circuit = RlpDecoderCircuit::<F>::new(max_txs, max_calldata, vec![]);
+        let encodable_txs: Vec<SignedTransaction> =
+            txs.iter().map(|tx| tx.into()).collect::<Vec<_>>();
+        let rlp_bytes = rlp::encode_list(&encodable_txs);
+        println!("input rlp_bytes = {:?}", hex::encode(&rlp_bytes));
 
+        let circuit = RlpDecoderCircuit::<F>::new(rlp_bytes.to_vec(), k as usize);
         let prover = match MockProver::run(k, &circuit, vec![]) {
             Ok(prover) => prover,
             Err(e) => panic!("{:#?}", e),
@@ -1136,50 +2110,84 @@ mod rlp_decode_circuit_tests {
     }
 
     #[test]
-    fn tx_circuit_1tx_1max_tx() {
-        const MAX_TXS: usize = 1;
-        const MAX_CALLDATA: usize = 32;
-
-        let chain_id: u64 = mock::MOCK_CHAIN_ID.as_u64();
-
-        let tx: Transaction = mock::CORRECT_MOCK_TXS[0].clone().into();
-
-        assert_eq!(run::<Fr>(vec![tx], chain_id, MAX_TXS, MAX_CALLDATA), Ok(()));
+    fn tx_circuit_0tx() {
+        assert_eq!(run::<Fr>(vec![]), Ok(()));
     }
 
     #[test]
-    fn tx_circuit_1tx_2max_tx() {
-        const MAX_TXS: usize = 2;
-        const MAX_CALLDATA: usize = 32;
-
-        let chain_id: u64 = mock::MOCK_CHAIN_ID.as_u64();
-
+    fn tx_circuit_1tx() {
         let tx: Transaction = mock::CORRECT_MOCK_TXS[0].clone().into();
-
-        assert_eq!(run::<Fr>(vec![tx], chain_id, MAX_TXS, MAX_CALLDATA), Ok(()));
+        assert_eq!(run::<Fr>(vec![tx]), Ok(()));
     }
 
     #[test]
-    fn tx_circuit_bad_address() {
-        const MAX_TXS: usize = 1;
-        const MAX_CALLDATA: usize = 32;
+    fn tx_circuit_2tx() {
+        let tx1: Transaction = mock::CORRECT_MOCK_TXS[0].clone().into();
+        let tx2: Transaction = mock::CORRECT_MOCK_TXS[1].clone().into();
+        assert_eq!(run::<Fr>(vec![tx1, tx2]), Ok(()));
+    }
 
-        let mut tx = mock::CORRECT_MOCK_TXS[0].clone();
-        // This address doesn't correspond to the account that signed this tx.
-        tx.from = AddrOrWallet::from(address!("0x1230000000000000000000000000000000000456"));
+    #[test]
+    fn tx_circuit_1tx_non_to() {
+        let mut rng = ChaCha20Rng::seed_from_u64(2u64);
+        let tx = mock::MockTransaction::default()
+            .from(AddrOrWallet::random(&mut rng))
+            .build()
+            .into();
+        assert_eq!(run::<Fr>(vec![tx]), Ok(()));
+    }
 
-        assert!(run::<Fr>(
-            vec![tx.into()],
-            mock::MOCK_CHAIN_ID.as_u64(),
-            MAX_TXS,
-            MAX_CALLDATA
-        )
-        .is_err(),);
+    #[test]
+    fn tx_circuit_tx_with_various_input() {
+        let mut rng = ChaCha20Rng::seed_from_u64(2u64);
+        let mut tx = mock::MockTransaction::default()
+            .from(AddrOrWallet::random(&mut rng))
+            .input(eth_types::Bytes::from(b"0"))
+            .build()
+            .into();
+        assert_eq!(run::<Fr>(vec![tx]), Ok(()));
+
+        tx = mock::MockTransaction::default()
+            .from(AddrOrWallet::random(&mut rng))
+            .input(eth_types::Bytes::from(b"1"))
+            .build()
+            .into();
+        assert_eq!(run::<Fr>(vec![tx]), Ok(()));
+
+        tx = mock::MockTransaction::default()
+            .from(AddrOrWallet::random(&mut rng))
+            .input(eth_types::Bytes::from(
+                (0..55).map(|v| v % 255).collect::<Vec<u8>>(),
+            ))
+            .build()
+            .into();
+        assert_eq!(run::<Fr>(vec![tx]), Ok(()));
+
+        tx = mock::MockTransaction::default()
+            .from(AddrOrWallet::random(&mut rng))
+            .input(eth_types::Bytes::from(
+                (0..65536).map(|v| v as u8).collect::<Vec<u8>>(),
+            ))
+            .build()
+            .into();
+        assert_eq!(run::<Fr>(vec![tx]), Ok(()));
+
+        tx = mock::MockTransaction::default()
+            .from(AddrOrWallet::random(&mut rng))
+            .input(eth_types::Bytes::from(
+                (0..65536 * 2).map(|v| v as u8).collect::<Vec<u8>>(),
+            ))
+            .build()
+            .into();
+        assert_eq!(run::<Fr>(vec![tx.clone(), tx.clone()]), Ok(()));
     }
 }
 
+#[cfg(test)]
 mod bench {
+    use super::*;
     use ark_std::{end_timer, start_timer};
+    use eth_types::Bytes;
     use halo2_proofs::{
         halo2curves::bn256::{Bn256, Fr, G1Affine},
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof},
@@ -1195,14 +2203,9 @@ mod bench {
             Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer,
         },
     };
-    use std::env::var;
-
     use rand::SeedableRng;
-
     use rand_chacha::ChaChaRng;
-
-    use super::*;
-    use crate::util::log2_ceil;
+    use std::env::var;
 
     #[test]
     fn bench_super_circuit_prover() {
@@ -1218,13 +2221,8 @@ mod bench {
             .expect("Cannot parse DEGREE env var as u32");
 
         let mut rng = ChaChaRng::seed_from_u64(2);
-
-        let (circuit, instance) = {
-            let mut circuit = RlpDecoderCircuit::<Fr>::new(10, 16384, vec![]);
-            let instance = vec![vec![]];
-            (circuit, instance)
-        };
-        let instance_refs: Vec<&[Fr]> = instance.iter().map(|v| &v[..]).collect();
+        let input_bytes = hex::decode("f850f84e8001830f4240808080820a97a0805d3057e9b74379d814e2c4d264be888a9b560ea2256781af8a6ea83af41208a07168d2b6d3aa47cbc5020c8a9b120926a197e1135b3aaa13ef0b292663345c15").unwrap();
+        let circuit = RlpDecoderCircuit::<Fr>::new(input_bytes, degree as usize);
 
         // Bench setup generation
         let setup_message = format!("{} {} with degree = {}", BENCHMARK_ID, setup_prfx, degree);
