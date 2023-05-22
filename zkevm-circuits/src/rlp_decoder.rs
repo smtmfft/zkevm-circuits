@@ -5,7 +5,8 @@ use std::marker::PhantomData;
 use crate::{
     evm_circuit::util::{constraint_builder::BaseConstraintBuilder, rlc},
     impl_expr,
-    table::{KeccakTable, TxTable},
+    rlp_decoder_tables::{RMultPowTable, RlpDecoderTable, TxFieldSwitchTable},
+    table::KeccakTable,
     util::{log2_ceil, Challenges, SubCircuit, SubCircuitConfig},
     witness,
 };
@@ -22,10 +23,6 @@ use halo2_proofs::{
     },
     poly::Rotation,
 };
-// use itertools::Itertools;
-// use log::error;
-// use sign_verify::{AssignedSignatureVerify, SignVerifyChip, SignVerifyConfig};
-// use std::marker::PhantomData;
 
 use crate::util::Expr;
 pub use halo2_proofs::halo2curves::{
@@ -87,24 +84,6 @@ impl<T> std::ops::Index<RlpDecodeTypeTag> for Vec<T> {
     fn index(&self, index: RlpDecodeTypeTag) -> &Self::Output {
         &self[index as usize]
     }
-}
-
-// single, null, short, long1, long2, long3, long4, partial, length, r_mult
-//      1,     0,    0,     0,     0,     0,     0,     0,      1~3,   r^(0~2)
-//      0,     1,    0,     0,     0,     0,     0,     0,      1,     r^0
-//      0,     0,    1,     0,     0,     0,     0,     0,      1~33,  r^(0~32)
-//      0,     0,    1,     0,     0,     0,     0,     0,      2,     r^1
-//                   .
-//      0,     0,    0,     1,     0,     0,     0,     0,      1~33,  r^(0~32)
-//      0,     0,    0,     0,     1,     0,     0,     0,      1~33,  r^(0~32)
-//      0,     0,    0,     0,     0,     1,     0,     0,      1~33,  r^(0~32)
-//      0,     0,    0,     0,     0,     0,     1,     0,      1~33,  r^(0~32)
-//      0,     0,    0,     0,     0,     0,     0,     1,      1~33,  r^(0~32)
-#[derive(Clone, Debug)]
-struct RlpDecodeTable {
-    rlp_type: [Column<Fixed>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
-    bytes_length: Column<Fixed>, // max 33 bytes
-    r_mult: Column<Advice>,
 }
 
 // TODO: combine with TxFieldTag in table.rs
@@ -181,7 +160,8 @@ pub enum RlpTxTypeTag {
 }
 impl_expr!(RlpTxTypeTag);
 
-const MAX_BYTE_COLUMN_NUM: usize = 33;
+/// max byte column num which is used to store the rlp raw bytes
+pub const MAX_BYTE_COLUMN_NUM: usize = 33;
 
 /// Witness for RlpDecoderCircuit
 #[derive(Clone, Debug, Default)]
@@ -272,8 +252,12 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
 #[derive(Clone, Debug)]
 /// Circuit configuration arguments
 pub struct RlpDecoderCircuitConfigArgs<F: Field> {
-    /// TxTable
-    pub tx_table: TxTable,
+    /// RlpDecoderTable
+    pub rlp_decoder_table: RlpDecoderTable,
+    /// state transition table
+    pub tx_field_switch_table: TxFieldSwitchTable,
+    /// r_mult pow table
+    pub r_mult_pow_table: RMultPowTable,
     /// KeccakTable
     pub keccak_table: KeccakTable,
     /// Challenges
@@ -313,15 +297,67 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             .collect::<Vec<Column<Advice>>>()
             .try_into()
             .unwrap();
-        let q_enable = meta.selector();
+        let q_enable = meta.complex_selector();
         let q_first = meta.fixed_column();
         let q_last = meta.fixed_column();
 
-        // TODO: lookup rlp_types table, which may also include bytes[1] as prefix of len
-        // also need to be constrainted
-        // TODO: lookup r_mult table with length, also as r_mult is adv, add constraint for pow
         // TODO: lookup bytes range table
         // TODO: lookup q_fields table
+
+        // lookup rlp_types table
+        // TODO: bytes[1] as prefix of len also need to be constrainted
+        meta.lookup_any("rlp decodable check", |meta| {
+            let tag = meta.query_advice(tag, Rotation::cur());
+            let byte0 = meta.query_advice(bytes[0], Rotation::cur());
+            let decodable = meta.query_advice(decodable, Rotation::cur());
+            let q_enable = meta.query_selector(q_enable);
+
+            let tag_in_table =
+                meta.query_fixed(args.rlp_decoder_table.tx_field_tag, Rotation::cur());
+            let byte0_in_table = meta.query_fixed(args.rlp_decoder_table.byte_0, Rotation::cur());
+            let decodable_in_table =
+                meta.query_fixed(args.rlp_decoder_table.decodable, Rotation::cur());
+            vec![
+                (q_enable.expr() * tag, tag_in_table),
+                (q_enable.expr() * byte0, byte0_in_table),
+                (q_enable.expr() * decodable, decodable_in_table),
+            ]
+        });
+
+        // // lookup tx_field_switch table
+        meta.lookup_any("rlp tx field transition", |meta| {
+            let current_field = meta.query_advice(tag, Rotation::cur());
+            let next_filed = meta.query_advice(tag, Rotation::next());
+            let current_field_in_table =
+                meta.query_fixed(args.tx_field_switch_table.current_tx_field, Rotation::cur());
+            let next_field_in_table =
+                meta.query_fixed(args.tx_field_switch_table.next_tx_field, Rotation::cur());
+            let q_enable = meta.query_selector(q_enable);
+            let is_last = meta.query_fixed(q_last, Rotation::cur());
+
+            vec![
+                (
+                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * current_field,
+                    current_field_in_table,
+                ),
+                (
+                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * next_filed,
+                    next_field_in_table,
+                ),
+            ]
+        });
+
+        // // lookup r_mult table with length,
+        // // TODO: r_mult is adv, add constraint for pow
+        // meta.lookup_any("rlp r_mult check", |meta| {
+        //     let r_mult = meta.query_advice(r_mult, Rotation::cur());
+        //     let pow = meta.query_advice(tag_bytes_in_row, Rotation::cur());
+        //     let r_mult_in_table = meta.query_fixed(args.r_mult_pow_table.r_mult,
+        // Rotation::cur());     let r_pow_in_table =
+        // meta.query_fixed(args.r_mult_pow_table.length, Rotation::cur());
+
+        //     vec![(r_mult, r_mult_in_table), (pow, r_pow_in_table)]
+        // });
 
         meta.create_gate("common constraints for all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
@@ -1311,7 +1347,10 @@ impl<F: Field> RlpDecoderCircuit<F> {
 
     fn calc_min_num_rows(txs_len: usize, call_data_rows: usize) -> usize {
         // add 2 for prev and next rotations.
-        txs_len * LEGACY_TX_FIELD_NUM + call_data_rows + NUM_BLINDING_ROWS + 2
+        let constraint_size = txs_len * LEGACY_TX_FIELD_NUM + call_data_rows + 2;
+        let tables_size =
+            RlpDecoderTable::table_size() + TxFieldSwitchTable::table_size() + MAX_BYTE_COLUMN_NUM;
+        constraint_size + tables_size + NUM_BLINDING_ROWS
     }
 }
 
@@ -1351,9 +1390,16 @@ impl<F: Field> SubCircuit<F> for RlpDecoderCircuit<F> {
         let witness: Vec<RlpDecoderCircuitConfigWitness<F>> =
             rlp_decode_tx_list_manually(&self.bytes, randomness, self.size as u32);
 
-        // for iw in witness.iter().take(100).enumerate() {
-        //     println!("witness[{}] {:?}", iw.0, iw.1);
-        // }
+        config.args.rlp_decoder_table.load(layouter, challenges)?;
+        config
+            .args
+            .tx_field_switch_table
+            .load(layouter, challenges)?;
+        config.args.r_mult_pow_table.load(layouter, challenges)?;
+        config
+            .args
+            .keccak_table
+            .dev_load(layouter, vec![&self.bytes], challenges)?;
 
         layouter.assign_region(
             || "rlp witness region",
@@ -1381,7 +1427,9 @@ impl<F: Field> Circuit<F> for RlpDecoderCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let tx_table = TxTable::construct(meta);
+        let rlp_decoder_table = RlpDecoderTable::construct(meta);
+        let tx_field_switch_table = TxFieldSwitchTable::construct(meta);
+        let r_mult_pow_table = RMultPowTable::construct(meta);
         let keccak_table = KeccakTable::construct(meta);
         let challenges = Challenges::construct(meta);
 
@@ -1392,7 +1440,9 @@ impl<F: Field> Circuit<F> for RlpDecoderCircuit<F> {
             RlpDecoderCircuitConfig::new(
                 meta,
                 RlpDecoderCircuitConfigArgs {
-                    tx_table,
+                    rlp_decoder_table,
+                    tx_field_switch_table,
+                    r_mult_pow_table,
                     keccak_table,
                     challenges: challenges_expr,
                 },
@@ -1804,10 +1854,15 @@ fn rlp_decode_tx_list_manually<F: Field>(
 
     let witness_len = witness.len();
     assert!(k > (witness_len + 2 + NUM_BLINDING_ROWS) as u32);
-    complete_paddings(
+    let complete_witness = complete_paddings(
         &mut witness,
         k as usize - witness_len - 2 - NUM_BLINDING_ROWS,
-    )
+    );
+
+    // for iw in complete_witness.iter().enumerate() {
+    //     println!("witness[{}] {:?}", iw.0, iw.1);
+    // }
+    complete_witness
 }
 
 fn fixup_acc_rlc<F: Field>(witness: &mut Vec<RlpDecoderCircuitConfigWitness<F>>, randomness: F) {
@@ -2099,7 +2154,11 @@ mod rlp_decode_circuit_tests {
         let encodable_txs: Vec<SignedTransaction> =
             txs.iter().map(|tx| tx.into()).collect::<Vec<_>>();
         let rlp_bytes = rlp::encode_list(&encodable_txs);
-        println!("input rlp_bytes = {:?}", hex::encode(&rlp_bytes));
+        println!(
+            "input rlp_bytes = {:?}, k = {}.",
+            hex::encode(&rlp_bytes),
+            k
+        );
 
         let circuit = RlpDecoderCircuit::<F>::new(rlp_bytes.to_vec(), k as usize);
         let prover = match MockProver::run(k, &circuit, vec![]) {
