@@ -51,6 +51,7 @@ impl<F: Field> IsZeroConfig<F> {
     }
 }
 
+#[derive(Clone, Debug)]
 /// Wrapper arround [`IsZeroConfig`] for which [`Chip`] is implemented.
 pub struct IsZeroChip<F> {
     config: IsZeroConfig<F>,

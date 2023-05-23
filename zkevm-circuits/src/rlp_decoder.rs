@@ -15,7 +15,10 @@ use ethers_core::{
     types::TransactionRequest,
     utils::rlp::{self, PayloadInfo},
 };
-use gadgets::util::{and, not};
+use gadgets::{
+    is_equal::{IsEqualChip, IsEqualConfig, IsEqualInstruction},
+    util::{and, not},
+};
 use halo2_proofs::{
     circuit::{Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
@@ -41,6 +44,8 @@ const NUM_BLINDING_ROWS: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum RlpDecodeTypeTag {
     #[default]
+    /// Nothing for no rlp decoding
+    DoNothing,
     /// SingleByte: 0x00 - 0x7f
     SingleByte,
     /// NullValue: 0x80
@@ -175,7 +180,7 @@ pub struct RlpDecoderCircuitConfigWitness<F: Field> {
     /// complete column
     pub complete: bool,
     /// rlp types: [single, short, long, very_long, fixed(33)]
-    pub rlp_types: [bool; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
+    pub rlp_type: RlpDecodeTypeTag,
     /// rlp_tag_length, the length of this rlp field
     pub rlp_tag_length: u64,
     /// remained rows, for n < 33 fields, it is n, for m > 33 fields, it is 33 and next row is
@@ -217,7 +222,9 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     /// complete column
     pub complete: Column<Advice>,
     /// rlp types: [single, short, long, very_long, fixed(33)]
-    pub rlp_types: [Column<Advice>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
+    pub rlp_type: Column<Advice>,
+    /// rlp_type checking gadget
+    pub is_rlp_type: [IsEqualConfig<F>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
     /// rlp_tag_length, the length of this rlp field
     pub rlp_tag_length: Column<Advice>,
     /// remained rows, for n < 33 fields, it is n, for m > 33 fields, it is 33 and next row is
@@ -273,12 +280,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         let tx_type = meta.advice_column();
         let tag = meta.advice_column();
         let complete = meta.advice_column();
-        let rlp_types: [Column<Advice>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] = (0
-            ..RlpDecodeTypeTag::RlpDecodeTypeNum as usize)
-            .map(|_| meta.advice_column())
-            .collect::<Vec<Column<Advice>>>()
-            .try_into()
-            .unwrap();
+        let rlp_type = meta.advice_column();
         let rlp_tag_length = meta.advice_column();
         let tag_bytes_in_row = meta.advice_column();
         let rlp_remain_length = meta.advice_column();
@@ -301,26 +303,57 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         let q_first = meta.fixed_column();
         let q_last = meta.fixed_column();
 
+        // type checking
+        let is_rlp_type: [IsEqualConfig<F>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] = (0
+            ..RlpDecodeTypeTag::RlpDecodeTypeNum as usize)
+            .map(|t| {
+                IsEqualChip::configure(
+                    meta,
+                    |meta| meta.query_selector(q_enable),
+                    |meta| meta.query_advice(rlp_type, Rotation::cur()),
+                    |_| t.expr(),
+                )
+            })
+            .collect::<Vec<IsEqualConfig<F>>>()
+            .try_into()
+            .unwrap();
+
         // TODO: lookup bytes range table
         // TODO: lookup q_fields table
 
         // lookup rlp_types table
         // TODO: bytes[1] as prefix of len also need to be constrainted
         meta.lookup_any("rlp decodable check", |meta| {
+            let tx_type = meta.query_advice(tx_type, Rotation::cur());
             let tag = meta.query_advice(tag, Rotation::cur());
             let byte0 = meta.query_advice(bytes[0], Rotation::cur());
             let decodable = meta.query_advice(decodable, Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
 
+            let is_not_partial =
+                not::expr(is_rlp_type[RlpDecodeTypeTag::PartialRlp as usize].is_equal());
+
+            let tx_type_in_table =
+                meta.query_fixed(args.rlp_decoder_table.tx_type, Rotation::cur());
             let tag_in_table =
                 meta.query_fixed(args.rlp_decoder_table.tx_field_tag, Rotation::cur());
             let byte0_in_table = meta.query_fixed(args.rlp_decoder_table.byte_0, Rotation::cur());
             let decodable_in_table =
                 meta.query_fixed(args.rlp_decoder_table.decodable, Rotation::cur());
             vec![
-                (q_enable.expr() * tag, tag_in_table),
-                (q_enable.expr() * byte0, byte0_in_table),
-                (q_enable.expr() * decodable, decodable_in_table),
+                (
+                    q_enable.expr() * is_not_partial.expr() * tx_type,
+                    tx_type_in_table,
+                ),
+                (q_enable.expr() * is_not_partial.expr() * tag, tag_in_table),
+                (
+                    q_enable.expr() * is_not_partial.expr() * byte0,
+                    byte0_in_table,
+                ),
+                (
+                    q_enable.expr() * is_not_partial.expr() * decodable,
+                    decodable_in_table,
+                ),
             ]
         });
 
@@ -347,24 +380,33 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             ]
         });
 
-        // // lookup r_mult table with length,
-        // // TODO: r_mult is adv, add constraint for pow
-        // meta.lookup_any("rlp r_mult check", |meta| {
-        //     let r_mult = meta.query_advice(r_mult, Rotation::cur());
-        //     let pow = meta.query_advice(tag_bytes_in_row, Rotation::cur());
-        //     let r_mult_in_table = meta.query_fixed(args.r_mult_pow_table.r_mult,
-        // Rotation::cur());     let r_pow_in_table =
-        // meta.query_fixed(args.r_mult_pow_table.length, Rotation::cur());
+        // lookup r_mult table with length,
+        // TODO: r_mult is adv, add constraint for pow
+        meta.lookup_any("rlp r_mult check", |meta| {
+            let r_mult = meta.query_advice(r_mult, Rotation::cur());
+            let pow = meta.query_advice(tag_bytes_in_row, Rotation::cur());
+            let r_mult_in_table = meta.query_fixed(args.r_mult_pow_table.r_mult, Rotation::cur());
+            let r_pow_in_table = meta.query_fixed(args.r_mult_pow_table.length, Rotation::cur());
 
-        //     vec![(r_mult, r_mult_in_table), (pow, r_pow_in_table)]
-        // });
+            vec![(r_mult, r_mult_in_table), (pow, r_pow_in_table)]
+        });
 
         meta.create_gate("common constraints for all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
             let valid_cur = meta.query_advice(valid, Rotation::cur());
             let valid_next = meta.query_advice(valid, Rotation::next());
-            cb.require_equal("valid should be consistent", valid_cur, valid_next);
+            cb.require_equal(
+                "valid should be consistent",
+                valid_cur.expr(),
+                valid_next.expr(),
+            );
+
+            let decodable = meta.query_advice(decodable, Rotation::cur());
+            cb.require_zero(
+                "if decode == 0 then valid must 0",
+                not::expr(decodable.expr()) * valid_cur.expr(),
+            );
 
             cb.gate(and::expr([
                 meta.query_selector(q_enable),
@@ -376,22 +418,12 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         meta.create_gate("tx fields common constraints", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
-            let tx_id = meta.query_advice(tx_id, Rotation::cur());
-            let tx_type = meta.query_advice(tx_type, Rotation::cur());
             let tag = meta.query_advice(tag, Rotation::cur());
             let complete_cur = meta.query_advice(complete, Rotation::cur());
-            let rlp_types_cur: [Expression<F>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] =
-                rlp_types
-                    .iter()
-                    .map(|rlp_type| meta.query_advice(*rlp_type, Rotation::cur()))
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap();
             let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let tag_bytes_in_row_cur = meta.query_advice(tag_bytes_in_row, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let value = meta.query_advice(value, Rotation::cur());
             let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
                 .iter()
@@ -414,83 +446,70 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_boolean("decodable", decodable);
             cb.require_boolean("valid", valid);
 
-            rlp_types_cur.iter().for_each(|rlp_type_cur| {
-                cb.require_boolean("rlp_type boolean", rlp_type_cur.expr());
-            });
-
             // length with leading bytes
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::SingleByte].expr(), |cb| {
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::DoNothing].is_equal(), |cb| {
+                cb.require_equal("0 length", rlp_tag_length_cur.clone(), 0.expr())
+            });
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::SingleByte].is_equal(), |cb| {
                 cb.require_equal("single length", rlp_tag_length_cur.clone(), 1.expr())
             });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::NullValue].expr(), |cb| {
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::NullValue].is_equal(), |cb| {
                 cb.require_equal("empty length", rlp_tag_length_cur.clone(), 1.expr())
             });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::ShortString].expr(), |cb| {
-                cb.require_equal(
-                    "ShortString length",
-                    rlp_tag_length_cur.clone(),
-                    byte_cells_cur[0].expr() - 0x80.expr() + 1.expr(),
-                )
-            });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongString1].expr(), |cb| {
-                cb.require_equal(
-                    "Long String 0xb8 length",
-                    rlp_tag_length_cur.clone(),
-                    byte_cells_cur[1].expr() + 2.expr(),
-                )
-            });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongString2].expr(), |cb| {
-                cb.require_equal(
-                    "Long String 0xb9 length",
-                    rlp_tag_length_cur.clone(),
-                    byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr() + 3.expr(),
-                )
-            });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongString3].expr(), |cb| {
-                cb.require_equal(
-                    "Long String 0xba length",
-                    rlp_tag_length_cur.clone(),
-                    byte_cells_cur[1].expr() * 65536.expr()
-                        + byte_cells_cur[2].expr() * 256.expr()
-                        + byte_cells_cur[3].expr()
-                        + 4.expr(),
-                )
-            });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::EmptyList].expr(), |cb| {
+            cb.condition(
+                is_rlp_type[RlpDecodeTypeTag::ShortString].is_equal(),
+                |cb| {
+                    cb.require_equal(
+                        "ShortString length",
+                        rlp_tag_length_cur.clone(),
+                        byte_cells_cur[0].expr() - 0x80.expr() + 1.expr(),
+                    )
+                },
+            );
+            cb.condition(
+                is_rlp_type[RlpDecodeTypeTag::LongString1].is_equal(),
+                |cb| {
+                    cb.require_equal(
+                        "Long String 0xb8 length",
+                        rlp_tag_length_cur.clone(),
+                        byte_cells_cur[1].expr() + 2.expr(),
+                    )
+                },
+            );
+            cb.condition(
+                is_rlp_type[RlpDecodeTypeTag::LongString2].is_equal(),
+                |cb| {
+                    cb.require_equal(
+                        "Long String 0xb9 length",
+                        rlp_tag_length_cur.clone(),
+                        byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr() + 3.expr(),
+                    )
+                },
+            );
+            cb.condition(
+                is_rlp_type[RlpDecodeTypeTag::LongString3].is_equal(),
+                |cb| {
+                    cb.require_equal(
+                        "Long String 0xba length",
+                        rlp_tag_length_cur.clone(),
+                        byte_cells_cur[1].expr() * 65536.expr()
+                            + byte_cells_cur[2].expr() * 256.expr()
+                            + byte_cells_cur[3].expr()
+                            + 4.expr(),
+                    )
+                },
+            );
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::EmptyList].is_equal(), |cb| {
                 cb.require_equal("empty list length", rlp_tag_length_cur.clone(), 1.expr())
             });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::ShortList].expr(), |cb| {
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::ShortList].is_equal(), |cb| {
                 cb.require_equal(
                     "short length",
                     rlp_tag_length_cur.clone(),
                     byte_cells_cur[0].expr() - 0xc0.expr() + 1.expr(),
                 )
             });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList1].expr(), |cb| {
-                cb.require_equal(
-                    "long length: f8 + 1",
-                    rlp_tag_length_cur.clone(),
-                    byte_cells_cur[1].expr() + 2.expr(),
-                )
-            });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList2].expr(), |cb| {
-                cb.require_equal(
-                    "long length: f9 + 2",
-                    rlp_tag_length_cur.clone(),
-                    byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr() + 3.expr(),
-                )
-            });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList3].expr(), |cb| {
-                cb.require_equal(
-                    "long length: fa + 3",
-                    rlp_tag_length_cur.clone(),
-                    byte_cells_cur[1].expr() * 65536.expr()
-                        + byte_cells_cur[2].expr() * 256.expr()
-                        + byte_cells_cur[3].expr()
-                        + 4.expr(),
-                )
-            });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::PartialRlp].expr(), |cb| {
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::PartialRlp].is_equal(), |cb| {
                 cb.require_equal(
                     "length = prev_length - prev_bytes_in_row",
                     rlp_tag_length_cur.clone(),
@@ -502,6 +521,8 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     "above row is incomplete",
                     meta.query_advice(complete, Rotation::prev()),
                 );
+
+                cb.require_equal("only data has partial rlp", tag, RlpTxFieldTag::Data.expr());
             });
 
             cb.condition(complete_cur.expr(), |cb| {
@@ -542,33 +563,22 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         });
 
         // TxListHeader in the first row
-        meta.create_gate("txListHeader", |meta| {
+        meta.create_gate("txListHeader in first row", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
             let tx_id = meta.query_advice(tx_id, Rotation::cur());
             let tx_type_cur = meta.query_advice(tx_type, Rotation::cur());
             let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let tag_next = meta.query_advice(tag, Rotation::next());
             let complete = meta.query_advice(complete, Rotation::cur());
-            let rlp_types_cur: [Expression<F>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] =
-                rlp_types
-                    .iter()
-                    .map(|rlp_type| meta.query_advice(*rlp_type, Rotation::cur()))
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap();
-
             let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let value = meta.query_advice(value, Rotation::cur());
             let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
             let decodable = meta.query_advice(decodable, Rotation::cur());
-            let valid = meta.query_advice(valid, Rotation::cur());
             let q_first = meta.query_fixed(q_first, Rotation::cur());
 
             cb.require_zero("0 tx_id", tx_id);
@@ -576,48 +586,15 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_zero("0 tx_tag", tag_cur);
             cb.require_equal("field completed", complete.expr(), 1.expr());
 
-            // next should be nonce if legacy(0) or chain_id if 1559
-            cb.condition(not::expr(tx_type_cur.expr()), |cb| {
-                let tx_type_next = meta.query_advice(tx_type, Rotation::next());
-                cb.require_equal(
-                    "next tx is legacy",
-                    tx_type_next,
-                    RlpTxTypeTag::TxLegacyType.expr(),
-                );
-                cb.require_in_set(
-                    "next field is txRlpHeader or Padding",
-                    tag_next,
-                    vec![
-                        RlpTxFieldTag::TxRlpHeader.expr(),
-                        RlpTxFieldTag::Padding.expr(),
-                    ],
-                );
-            });
-
-            // TODO: enable 1559
-            // cb.condition("tx 1559", |cb| {
-            //     let next_tx_type = meta.query_advice(tx_type, Rotation::next());
-            //     cb.require_equal(
-            //         "next tx is 1559",
-            //         next_tx_type,
-            //         RlpTxTypeTag::Tx1559Type.expr(),
-            //     );
-            //     cb.require_equal(
-            //         "next field is nonce",
-            //         next_tag,
-            //         RlpTxFieldTag::ChainID.expr(),
-            //     );
-            // });
-
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList1].expr(), |cb| {
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::LongList1].is_equal(), |cb| {
                 cb.require_equal(
                     "long length: f8 + 1",
                     remain_length.expr(),
                     byte_cells_cur[1].expr(),
                 )
-                // TODO: byte_cells_cur[1] in (0, 55]
+                // TODO: byte_cells_cur[1] > 55
             });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList2].expr(), |cb| {
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::LongList2].is_equal(), |cb| {
                 cb.require_equal(
                     "long length: f9 + 2",
                     remain_length.expr(),
@@ -626,7 +603,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
                 // TODO: byte_cells_cur[1] != 0
             });
-            cb.condition(rlp_types_cur[RlpDecodeTypeTag::LongList3].expr(), |cb| {
+            cb.condition(is_rlp_type[RlpDecodeTypeTag::LongList3].is_equal(), |cb| {
                 cb.require_equal(
                     "long length: fa + 3",
                     remain_length.expr(),
@@ -638,13 +615,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             });
 
             cb.condition(decodable, |cb| {
-                // TODO: use look up??
-                cb.require_in_set(
-                    "txlist header in [0xf8,0xf9,0xfa]",
-                    byte_cells_cur[0].expr(),
-                    vec![192.expr(), 248.expr(), 249.expr(), 250.expr()],
-                );
-
                 cb.require_equal(
                     "rlp_tag_length = rlp_header length",
                     rlp_tag_length_cur.expr(),
@@ -662,7 +632,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.gate(q_first)
         });
 
-        meta.create_gate("txHeader", |meta| {
+        meta.create_gate("txHeader of legacy tx", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
             let tx_id_cur = meta.query_advice(tx_id, Rotation::cur());
@@ -673,15 +643,12 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let complete = meta.query_advice(complete, Rotation::cur());
             let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
-            let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let value = meta.query_advice(value, Rotation::cur());
             let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
             let decodable = meta.query_advice(decodable, Rotation::cur());
-            let valid = meta.query_advice(valid, Rotation::cur());
             let q_fields = q_fields
                 .iter()
                 .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
@@ -712,13 +679,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             });
 
             cb.condition(decodable, |cb| {
-                // TODO: use look up??
-                cb.require_in_set(
-                    "list header in [0xf8,0xf9,0xfa]",
-                    byte_cells_cur[0].expr(),
-                    vec![248.expr(), 249.expr(), 250.expr()],
-                );
-
                 cb.require_equal(
                     "rlp_tag_length = rlp_header length",
                     rlp_tag_length_cur.expr(),
@@ -736,302 +696,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.gate(q_fields[RlpTxFieldTag::TxRlpHeader].expr() * meta.query_selector(q_enable))
         });
 
-        // Nonce
-        meta.create_gate("Nonce", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let rlp_types = rlp_types
-                .iter()
-                .map(|rlp_type| meta.query_advice(*rlp_type, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("nonce tag", tag_cur, RlpTxFieldTag::Nonce.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-            // next is gas_price
-            cb.require_equal(
-                "next field is gas_price",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::GasPrice.expr(),
-            );
-
-            // TODO: decodable == 0 < bytes[0] <= 0x88, using lookup??
-            // i.e., lookup nonce rlp_type table, should be single or short
-
-            cb.gate(q_fields[RlpTxFieldTag::Nonce].expr() * meta.query_selector(q_enable))
-        });
-
-        // gas price
-        meta.create_gate("Gas price", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let rlp_types = rlp_types
-                .iter()
-                .map(|rlp_type| meta.query_advice(*rlp_type, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("gas price tag", tag_cur, RlpTxFieldTag::GasPrice.expr());
-            // next is gas_price
-            cb.require_equal(
-                "next field is gas_limit",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::Gas.expr(),
-            );
-
-            cb.require_equal(
-                "decodable if not null",
-                decodable,
-                not::expr(rlp_types[RlpDecodeTypeTag::NullValue].expr()),
-            );
-
-            cb.gate(q_fields[RlpTxFieldTag::GasPrice].expr() * meta.query_selector(q_enable))
-        });
-
-        // Gas
-        meta.create_gate("Gas", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let rlp_types = rlp_types
-                .iter()
-                .map(|rlp_type| meta.query_advice(*rlp_type, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::Gas.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-            cb.require_equal(
-                "next field is To",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::To.expr(),
-            );
-
-            cb.require_equal(
-                "decodable if not null",
-                decodable,
-                not::expr(rlp_types[RlpDecodeTypeTag::NullValue].expr()),
-            );
-
-            cb.gate(q_fields[RlpTxFieldTag::Gas].expr() * meta.query_selector(q_enable))
-        });
-
-        // To
-        meta.create_gate("To", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::To.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-            cb.require_equal(
-                "next field is Value",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::Value.expr(),
-            );
-
-            // TODO: Lookup fix length 0xa0/0x80
-            cb.condition(decodable.expr(), |cb| {
-                cb.require_in_set(
-                    "0x94 or 0x80",
-                    bytes[0].expr(),
-                    vec![148.expr(), 128.expr()],
-                );
-            });
-
-            cb.gate(q_fields[RlpTxFieldTag::To].expr() * meta.query_selector(q_enable))
-        });
-
-        // Value
-        meta.create_gate("Value", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::Value.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-            cb.require_equal(
-                "next field is Data",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::Data.expr(),
-            );
-
-            cb.gate(q_fields[RlpTxFieldTag::Value].expr() * meta.query_selector(q_enable))
-        });
-
-        // Data
-        meta.create_gate("Data", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::Data.expr());
-            cb.condition(complete, |cb| {
-                cb.require_equal(
-                    "next field is SignV",
-                    meta.query_advice(tag, Rotation::next()),
-                    RlpTxFieldTag::SignV.expr(),
-                );
-            });
-
-            cb.gate(q_fields[RlpTxFieldTag::Data].expr() * meta.query_selector(q_enable))
-        });
-
-        // V
-        meta.create_gate("SignV", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::SignV.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-            cb.require_equal(
-                "next field is SignR",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::SignR.expr(),
-            );
-
-            cb.gate(q_fields[RlpTxFieldTag::SignV].expr() * meta.query_selector(q_enable))
-        });
-
-        // R
-        meta.create_gate("SignR", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::SignR.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-
-            cb.condition(decodable.expr(), |cb| {
-                cb.require_equal(
-                    "decodable if valid rlp header",
-                    bytes[0].expr(),
-                    0xa0.expr(),
-                )
-            });
-
-            // next is signS
-            cb.require_equal(
-                "next field is SignR",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::SignS.expr(),
-            );
-
-            cb.gate(q_fields[RlpTxFieldTag::SignR].expr() * meta.query_selector(q_enable))
-        });
-
-        // S
-        meta.create_gate("SignS", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
-
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::SignS.expr());
-            cb.require_equal("field completed", complete.expr(), 1.expr());
-            // next is a new tx or padding
-            cb.require_in_set(
-                "next field is Nonce or Padding",
-                meta.query_advice(tag, Rotation::next()),
-                vec![
-                    RlpTxFieldTag::TxRlpHeader.expr(),
-                    RlpTxFieldTag::Padding.expr(),
-                ],
-            );
-
-            cb.gate(q_fields[RlpTxFieldTag::SignS].expr() * meta.query_selector(q_enable))
-        });
-
         // padding
         meta.create_gate("Padding", |meta| {
             let mut cb = BaseConstraintBuilder::default();
@@ -1041,13 +705,11 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let length = meta.query_advice(rlp_tag_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let value = meta.query_advice(value, Rotation::cur());
             let acc_rlc_value = meta.query_advice(acc_rlc_value, Rotation::cur());
-            let bytes = bytes
+            let bytes_values = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
             let q_last = meta.query_fixed(q_last, Rotation::cur());
             let q_fields = q_fields
                 .iter()
@@ -1056,12 +718,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             cb.require_equal("tag", tag_cur, RlpTxFieldTag::Padding.expr());
             cb.require_equal("field completed", complete.expr(), 1.expr());
-            // next is a new tx or padding
-            cb.require_equal(
-                "next field is Padding",
-                meta.query_advice(tag, Rotation::next()),
-                RlpTxFieldTag::Padding.expr(),
-            );
             cb.require_zero("padding has no r_mult", r_mult);
             cb.require_zero("padding has no length", length);
             cb.require_zero("padding has no remain length", remain_length);
@@ -1070,6 +726,9 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 meta.query_advice(rlp_remain_length, Rotation::prev()),
             );
             cb.require_equal("padding has no rlc (all 0)", acc_rlc_value, 0.expr());
+            bytes_values.iter().for_each(|byte| {
+                cb.require_zero("padding has no bytes", byte.expr());
+            });
 
             cb.gate(
                 q_fields[RlpTxFieldTag::Padding].expr()
@@ -1086,17 +745,13 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let length = meta.query_advice(rlp_tag_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let value = meta.query_advice(value, Rotation::cur());
             let acc_rlc_value = meta.query_advice(acc_rlc_value, Rotation::cur());
-            let bytes = bytes
-                .iter()
-                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
-                .collect::<Vec<_>>();
             let decodable = meta.query_advice(decodable, Rotation::cur());
             let valid = meta.query_advice(valid, Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
             let q_last = meta.query_fixed(q_last, Rotation::cur());
 
+            cb.require_equal("completed at last", complete, 1.expr());
             cb.require_equal("padding at last", tag_cur, RlpTxFieldTag::Padding.expr());
             cb.require_equal("padding has no r_mult", r_mult, 0.expr());
             cb.require_equal("padding has no length", length, 0.expr());
@@ -1104,7 +759,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_equal("padding has no rlc (all 0)", acc_rlc_value, 0.expr());
             cb.require_equal("valid == decodable", valid, decodable);
 
-            cb.gate(q_last)
+            cb.gate(q_last * q_enable)
         });
 
         Self {
@@ -1112,7 +767,8 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             tx_type,
             tag,
             complete,
-            rlp_types,
+            rlp_type,
+            is_rlp_type,
             rlp_tag_length,
             tag_bytes_in_row,
             r_mult,
@@ -1142,6 +798,19 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
         self.name_row_members(region);
         for wit in wits {
             self.assign_row(region, offset, wit)?;
+
+            self.is_rlp_type
+                .iter()
+                .enumerate()
+                .try_for_each(|(idx, config)| {
+                    let chip = IsEqualChip::construct(config.clone());
+                    chip.assign(
+                        region,
+                        offset,
+                        Value::known(F::from(wit.rlp_type as u64)),
+                        Value::known(F::from(idx as u64)),
+                    )
+                })?;
             offset += 1;
         }
         Ok(())
@@ -1152,9 +821,7 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
         region.name_column(|| "config.tx_type", self.tx_type);
         region.name_column(|| "config.tag", self.tag);
         region.name_column(|| "config.complete", self.complete);
-        for (i, rlp_type) in self.rlp_types.iter().enumerate() {
-            region.name_column(|| format!("config.rlp_types[{}]", i), *rlp_type);
-        }
+        region.name_column(|| "config.rlp_types", self.rlp_type);
         region.name_column(|| "config.rlp_tag_length", self.rlp_tag_length);
         region.name_column(|| "config.rlp_remain_length", self.rlp_remain_length);
         region.name_column(|| "config.r_mult", self.r_mult);
@@ -1197,14 +864,12 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
             offset,
             || Value::known(F::from(w.complete)),
         )?;
-        for (i, rlp_type) in self.rlp_types.iter().enumerate() {
-            region.assign_advice(
-                || format!("config.rlp_types[{}]", i),
-                *rlp_type,
-                offset,
-                || Value::known(F::from(w.rlp_types[i])),
-            )?;
-        }
+        region.assign_advice(
+            || "config.rlp_types",
+            self.rlp_type,
+            offset,
+            || Value::known(F::from(w.rlp_type as u64)),
+        )?;
         region.assign_advice(
             || "config.rlp_tag_length",
             self.rlp_tag_length,
@@ -1292,11 +957,6 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
         }
 
         Ok(())
-    }
-
-    /// Get number of rows required.
-    pub fn get_num_rows_required(num_tx: usize) -> usize {
-        return 0;
     }
 }
 
@@ -1465,50 +1125,26 @@ impl<F: Field> Circuit<F> for RlpDecoderCircuit<F> {
     }
 }
 
-fn generate_rlp_type_witness(
-    header_byte: u8,
-) -> ([bool; RlpDecodeTypeTag::RlpDecodeTypeNum as usize], bool) {
-    let mut rlp_types = [false; RlpDecodeTypeTag::RlpDecodeTypeNum as usize];
+fn generate_rlp_type_witness(header_byte: u8) -> (RlpDecodeTypeTag, bool) {
     let mut decodable = true;
-    match header_byte {
-        0x00..=0x7f => {
-            rlp_types[RlpDecodeTypeTag::SingleByte as usize] = true;
-        }
-        0x80 => {
-            rlp_types[RlpDecodeTypeTag::NullValue as usize] = true;
-        }
-        0x81..=0xb7 => {
-            rlp_types[RlpDecodeTypeTag::ShortString as usize] = true;
-        }
-        0xb8 => {
-            rlp_types[RlpDecodeTypeTag::LongString1 as usize] = true;
-        }
-        0xb9 => {
-            rlp_types[RlpDecodeTypeTag::LongString2 as usize] = true;
-        }
-        0xba => {
-            rlp_types[RlpDecodeTypeTag::LongString3 as usize] = true;
-        }
-        0xc0 => {
-            rlp_types[RlpDecodeTypeTag::EmptyList as usize] = true;
-        }
-        0xc1..=0xf7 => {
-            rlp_types[RlpDecodeTypeTag::ShortList as usize] = true;
-        }
-        0xf8 => {
-            rlp_types[RlpDecodeTypeTag::LongList1 as usize] = true;
-        }
-        0xf9 => {
-            rlp_types[RlpDecodeTypeTag::LongList2 as usize] = true;
-        }
-        0xfa => {
-            rlp_types[RlpDecodeTypeTag::LongList3 as usize] = true;
-        }
+    let rlp_type = match header_byte {
+        0x00..=0x7f => RlpDecodeTypeTag::SingleByte,
+        0x80 => RlpDecodeTypeTag::NullValue,
+        0x81..=0xb7 => RlpDecodeTypeTag::ShortString,
+        0xb8 => RlpDecodeTypeTag::LongString1,
+        0xb9 => RlpDecodeTypeTag::LongString2,
+        0xba => RlpDecodeTypeTag::LongString3,
+        0xc0 => RlpDecodeTypeTag::EmptyList,
+        0xc1..=0xf7 => RlpDecodeTypeTag::ShortList,
+        0xf8 => RlpDecodeTypeTag::LongList1,
+        0xf9 => RlpDecodeTypeTag::LongList2,
+        0xfa => RlpDecodeTypeTag::LongList3,
         _ => {
             decodable = false;
+            RlpDecodeTypeTag::NullValue
         }
-    }
-    (rlp_types, decodable)
+    };
+    (rlp_type, decodable)
 }
 
 fn generate_q_fields_witness(tag: &RlpTxFieldTag) -> [bool; LEGACY_TX_FIELD_NUM as usize] {
@@ -1536,12 +1172,8 @@ fn generate_rlp_row_witness<F: Field>(
     rlp_remain_length: usize,
 ) -> Vec<RlpDecoderCircuitConfigWitness<F>> {
     let mut witness = vec![];
-    let (mut rlp_types, decodable) = generate_rlp_type_witness(raw_bytes[0]);
-    let partial_rlp_types = {
-        let mut tmp = [false; RlpDecodeTypeTag::RlpDecodeTypeNum as usize];
-        tmp[RlpDecodeTypeTag::PartialRlp as usize] = true;
-        tmp
-    };
+    let (mut rlp_type, decodable) = generate_rlp_type_witness(raw_bytes[0]);
+    let partial_rlp_type = RlpDecodeTypeTag::PartialRlp;
     let q_fields = generate_q_fields_witness(tag);
     let rlp_tag_len = raw_bytes.len();
     let mut prev_rlp_remain_length = rlp_remain_length;
@@ -1557,7 +1189,7 @@ fn generate_rlp_row_witness<F: Field>(
                     tx_type: RlpTxTypeTag::TxLegacyType,
                     tag: tag.clone(),
                     complete: false,
-                    rlp_types: rlp_types,
+                    rlp_type: rlp_type,
                     rlp_tag_length: tag_remain_length as u64,
                     tag_bytes_in_row: MAX_BYTE_COLUMN_NUM as u8,
                     r_mult: r.pow(&[MAX_BYTE_COLUMN_NUM as u64, 0, 0, 0]),
@@ -1575,14 +1207,14 @@ fn generate_rlp_row_witness<F: Field>(
                 raw_bytes_offset += MAX_BYTE_COLUMN_NUM;
                 tag_remain_length -= MAX_BYTE_COLUMN_NUM;
                 prev_rlp_remain_length -= MAX_BYTE_COLUMN_NUM;
-                rlp_types = partial_rlp_types;
+                rlp_type = partial_rlp_type;
             }
             temp_witness_vec.push(RlpDecoderCircuitConfigWitness::<F> {
                 tx_id: tx_id,
                 tx_type: RlpTxTypeTag::TxLegacyType,
                 tag: tag.clone(),
                 complete: true,
-                rlp_types: rlp_types,
+                rlp_type: rlp_type,
                 rlp_tag_length: tag_remain_length as u64,
                 tag_bytes_in_row: tag_remain_length as u8,
                 r_mult: r.pow(&[tag_remain_length as u64, 0, 0, 0]),
@@ -1896,7 +1528,7 @@ fn complete_paddings<F: Field>(
             tx_type: RlpTxTypeTag::TxLegacyType,
             tag: RlpTxFieldTag::Padding,
             complete: true,
-            rlp_types: [false; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
+            rlp_type: RlpDecodeTypeTag::DoNothing,
             rlp_tag_length: 0,
             tag_bytes_in_row: 0,
             r_mult: F::zero(),
@@ -2246,7 +1878,6 @@ mod rlp_decode_circuit_tests {
 mod bench {
     use super::*;
     use ark_std::{end_timer, start_timer};
-    use eth_types::Bytes;
     use halo2_proofs::{
         halo2curves::bn256::{Bn256, Fr, G1Affine},
         plonk::{create_proof, keygen_pk, keygen_vk, verify_proof},

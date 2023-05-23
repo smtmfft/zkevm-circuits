@@ -1,21 +1,10 @@
 //! The rlp decoding tables implementation.
 
-use std::marker::PhantomData;
-
 use crate::{
-    evm_circuit::util::{constraint_builder::BaseConstraintBuilder, rlc},
-    impl_expr,
-    rlp_decoder::{RlpDecodeTypeTag, RlpTxFieldTag, MAX_BYTE_COLUMN_NUM},
-    table::{KeccakTable, TxTable},
-    util::{log2_ceil, Challenges, Expr, SubCircuit, SubCircuitConfig},
-    witness,
+    rlp_decoder::{RlpDecodeTypeTag, RlpTxFieldTag, RlpTxTypeTag, MAX_BYTE_COLUMN_NUM},
+    util::Challenges,
 };
-use eth_types::{Field, Signature, Transaction, Word};
-use ethers_core::{
-    types::TransactionRequest,
-    utils::rlp::{self, PayloadInfo},
-};
-use gadgets::util::{and, not};
+use eth_types::Field;
 pub use halo2_proofs::halo2curves::{
     group::{
         ff::{Field as GroupField, PrimeField},
@@ -25,11 +14,8 @@ pub use halo2_proofs::halo2curves::{
     secp256k1::{self, Secp256k1Affine, Secp256k1Compressed},
 };
 use halo2_proofs::{
-    circuit::{Layouter, Region, SimpleFloorPlanner, Value},
-    plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, SecondPhase, Selector,
-    },
-    poly::Rotation,
+    circuit::{Layouter, Region, Value},
+    plonk::{Column, ConstraintSystem, Error, Fixed},
 };
 
 /// Rlp encoding types
@@ -59,6 +45,7 @@ impl RlpDecodeRule {
     /// Get the length of the RLP encoding type
     pub fn load<F: Field>(
         &self,
+        tx_type: &RlpTxTypeTag,
         tx_field_tag: &RlpTxFieldTag,
         table: &RlpDecoderTable,
         region: &mut Region<'_, F>,
@@ -68,47 +55,51 @@ impl RlpDecodeRule {
             (0..256u64)
                 .map(|i| {
                     let (rlp_type, decodable, length) = match self {
-                        RlpDecodeRule::Padding => (RlpDecodeTypeTag::SingleByte, true, 0u64),
+                        RlpDecodeRule::Padding => (RlpDecodeTypeTag::DoNothing, true, 0u64),
                         RlpDecodeRule::Empty => match i {
                             0x80 => (RlpDecodeTypeTag::SingleByte, true, 1u64),
-                            _ => (RlpDecodeTypeTag::ShortString, false, 0u64),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0u64),
                         },
                         RlpDecodeRule::Uint64 => match i {
+                            // 0 is error: non-canonical integer (leading zero bytes) for uint64
                             1..=0x80 => (RlpDecodeTypeTag::SingleByte, true, 1u64),
                             0x81..=0x88 => (RlpDecodeTypeTag::ShortString, true, i - 0x80 + 1),
-                            _ => (RlpDecodeTypeTag::ShortString, false, 0u64),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0u64),
                         },
                         RlpDecodeRule::Uint96 => match i {
+                            // 0 is error: non-canonical integer (leading zero bytes) for uint96
                             1..=0x80 => (RlpDecodeTypeTag::SingleByte, true, 1),
                             0x81..=0x8c => (RlpDecodeTypeTag::ShortString, true, i - 0x80 + 1),
-                            _ => (RlpDecodeTypeTag::ShortString, false, 0),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
                         },
                         RlpDecodeRule::Address => match i {
                             0x94 => (RlpDecodeTypeTag::ShortString, true, 20 + 1),
-                            _ => (RlpDecodeTypeTag::ShortString, false, 0),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
                         },
                         RlpDecodeRule::Bytes32 => match i {
+                            // TODO: what if sig is less then 32 bytes?
                             0xa0 => (RlpDecodeTypeTag::ShortString, true, 20 + 1),
-                            _ => (RlpDecodeTypeTag::ShortString, false, 0),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
                         },
                         RlpDecodeRule::Bytes48K => match i {
-                            0 => (RlpDecodeTypeTag::SingleByte, false, 1),
-                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true, 1),
+                            0 => (RlpDecodeTypeTag::SingleByte, true, 1), // 0x00
+                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true, 1), // 0x01..=0x80
                             0x81..=0xbf => (RlpDecodeTypeTag::ShortString, true, i - 0x80 + 1),
-                            _ => (RlpDecodeTypeTag::ShortString, false, 0),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
                         },
                         RlpDecodeRule::EmptyList => match i {
                             0xc0 => (RlpDecodeTypeTag::ShortString, false, 0),
-                            _ => (RlpDecodeTypeTag::ShortString, false, 0),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
                         },
                         RlpDecodeRule::LongList => match i {
                             0xf8 => (RlpDecodeTypeTag::LongList1, true, 2),
                             0xf9 => (RlpDecodeTypeTag::LongList2, true, 3),
                             0xfa => (RlpDecodeTypeTag::LongList3, true, 4),
-                            _ => (RlpDecodeTypeTag::LongList1, false, 0),
+                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
                         },
                     };
                     [
+                        *tx_type as u64,
                         *tx_field_tag as u64,
                         rlp_type as u64,
                         i,
@@ -116,7 +107,7 @@ impl RlpDecodeRule {
                         length,
                     ]
                 })
-                .collect::<Vec<[u64; 5]>>()
+                .collect::<Vec<[u64; 6]>>()
         };
 
         let mut offset = offset;
@@ -125,6 +116,7 @@ impl RlpDecodeRule {
             rule_table_row
                 .iter()
                 .zip([
+                    table.tx_type,
                     table.tx_field_tag,
                     table.rlp_type,
                     table.byte_0,
@@ -150,6 +142,8 @@ impl RlpDecodeRule {
 /// Table that contains the fields of all possible RLP decodable fields
 #[derive(Clone, Debug)]
 pub struct RlpDecoderTable {
+    /// The tx type tag
+    pub tx_type: Column<Fixed>,
     /// The tx field tag
     pub tx_field_tag: Column<Fixed>,
     /// The RLP type
@@ -166,6 +160,7 @@ impl RlpDecoderTable {
     /// Construct a new RlpDecoderTable
     pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
         Self {
+            tx_type: meta.fixed_column(),
             tx_field_tag: meta.fixed_column(),
             rlp_type: meta.fixed_column(),
             byte_0: meta.fixed_column(),
@@ -186,28 +181,80 @@ impl RlpDecoderTable {
         challenges: &Challenges<Value<F>>,
     ) -> Result<(), Error> {
         // make a list with all member of rlpTxFieldTag literally
-        let rlp_tx_field_tag_list: Vec<(RlpTxFieldTag, RlpDecodeRule)> = vec![
-            (RlpTxFieldTag::TxListRlpHeader, RlpDecodeRule::LongList),
-            (RlpTxFieldTag::TxRlpHeader, RlpDecodeRule::LongList),
-            (RlpTxFieldTag::Nonce, RlpDecodeRule::Uint96),
-            (RlpTxFieldTag::GasPrice, RlpDecodeRule::Uint96),
-            (RlpTxFieldTag::Gas, RlpDecodeRule::Uint96),
-            (RlpTxFieldTag::To, RlpDecodeRule::Address),
-            (RlpTxFieldTag::To, RlpDecodeRule::Empty),
-            (RlpTxFieldTag::Value, RlpDecodeRule::Uint96),
-            (RlpTxFieldTag::Data, RlpDecodeRule::Bytes48K),
-            (RlpTxFieldTag::SignV, RlpDecodeRule::Uint96),
-            (RlpTxFieldTag::SignR, RlpDecodeRule::Bytes32),
-            (RlpTxFieldTag::SignS, RlpDecodeRule::Bytes48K),
-            (RlpTxFieldTag::Padding, RlpDecodeRule::Padding),
+        let rlp_tx_field_tag_list: Vec<(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRule)> = vec![
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::TxListRlpHeader,
+                RlpDecodeRule::LongList,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::TxRlpHeader,
+                RlpDecodeRule::LongList,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::Nonce,
+                RlpDecodeRule::Uint96,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::GasPrice,
+                RlpDecodeRule::Uint96,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::Gas,
+                RlpDecodeRule::Uint96,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::To,
+                RlpDecodeRule::Address,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::To,
+                RlpDecodeRule::Empty,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::Value,
+                RlpDecodeRule::Uint96,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::Data,
+                RlpDecodeRule::Bytes48K,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::SignV,
+                RlpDecodeRule::Uint96,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::SignR,
+                RlpDecodeRule::Bytes32,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::SignS,
+                RlpDecodeRule::Bytes48K,
+            ),
+            (
+                RlpTxTypeTag::TxLegacyType,
+                RlpTxFieldTag::Padding,
+                RlpDecodeRule::Padding,
+            ),
         ];
 
         layouter.assign_region(
             || "load rlp decoder table",
             |mut region| {
                 let mut offset = 0;
-                for (tx_field_tag, decode_rule) in rlp_tx_field_tag_list.iter() {
-                    decode_rule.load(tx_field_tag, self, &mut region, offset)?;
+                for (tx_type, tx_field_tag, decode_rule) in rlp_tx_field_tag_list.iter() {
+                    decode_rule.load(tx_type, tx_field_tag, self, &mut region, offset)?;
                     offset += 256;
                 }
                 Ok(())
@@ -327,7 +374,7 @@ impl RMultPowTable {
         let mut randomness = F::zero();
         challenges.keccak_input().map(|r| randomness = r);
 
-        (0..MAX_BYTE_COLUMN_NUM).try_for_each(|i| {
+        (0..=MAX_BYTE_COLUMN_NUM).try_for_each(|i| {
             layouter.assign_region(
                 || "load rlp r_mult table",
                 |mut region| {
