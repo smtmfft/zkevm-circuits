@@ -42,7 +42,14 @@ pub enum RlpDecodeRule {
 }
 
 impl RlpDecodeRule {
-    /// Get the length of the RLP encoding type
+    /// load the decode rult table, like.:
+    /// | tx_type(legacy/1559) | field | rlp type | byte[0] | decodable |
+    /// | legacy               | nonce | uint96   | 0x00    | false     |
+    /// | legacy               | nonce | uint96   | 0x01    | true      |
+    ///  ...
+    /// | legacy               | signS | byte32   | 0xa0    | true      |
+    /// | legacy               | signS | byte32   | 0xa1    | false     |
+    ///  ...
     pub fn load<F: Field>(
         &self,
         tx_type: &RlpTxTypeTag,
@@ -54,48 +61,51 @@ impl RlpDecodeRule {
         let rule_table_rows = {
             (0..256u64)
                 .map(|i| {
-                    let (rlp_type, decodable, length) = match self {
-                        RlpDecodeRule::Padding => (RlpDecodeTypeTag::DoNothing, true, 0u64),
+                    let (rlp_type, decodable) = match self {
+                        RlpDecodeRule::Padding => (RlpDecodeTypeTag::DoNothing, true),
                         RlpDecodeRule::Empty => match i {
-                            0x80 => (RlpDecodeTypeTag::SingleByte, true, 1u64),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0u64),
+                            0x80 => (RlpDecodeTypeTag::SingleByte, true),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                         RlpDecodeRule::Uint64 => match i {
                             // 0 is error: non-canonical integer (leading zero bytes) for uint64
-                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true, 1u64),
-                            0x81..=0x88 => (RlpDecodeTypeTag::ShortString, true, i - 0x80 + 1),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0u64),
+                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true),
+                            0x81..=0x88 => (RlpDecodeTypeTag::ShortString, true),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                         RlpDecodeRule::Uint96 => match i {
                             // 0 is error: non-canonical integer (leading zero bytes) for uint96
-                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true, 1),
-                            0x81..=0x8c => (RlpDecodeTypeTag::ShortString, true, i - 0x80 + 1),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
+                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true),
+                            0x81..=0x8c => (RlpDecodeTypeTag::ShortString, true),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                         RlpDecodeRule::Address => match i {
-                            0x94 => (RlpDecodeTypeTag::ShortString, true, 20 + 1),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
+                            0x94 => (RlpDecodeTypeTag::ShortString, true),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                         RlpDecodeRule::Bytes32 => match i {
                             // TODO: what if sig is less then 32 bytes?
-                            0xa0 => (RlpDecodeTypeTag::ShortString, true, 20 + 1),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
+                            0xa0 => (RlpDecodeTypeTag::ShortString, true),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                         RlpDecodeRule::Bytes48K => match i {
-                            0 => (RlpDecodeTypeTag::SingleByte, true, 1), // 0x00
-                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true, 1), // 0x01..=0x80
-                            0x81..=0xbf => (RlpDecodeTypeTag::ShortString, true, i - 0x80 + 1),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
+                            0 => (RlpDecodeTypeTag::SingleByte, true),        // 0x00
+                            1..=0x80 => (RlpDecodeTypeTag::SingleByte, true), // 0x01..=0x80
+                            0x81..=0xb7 => (RlpDecodeTypeTag::ShortString, true),
+                            0xb8 => (RlpDecodeTypeTag::LongString1, true),
+                            0xb9 => (RlpDecodeTypeTag::LongString2, true),
+                            0xba => (RlpDecodeTypeTag::LongString3, true),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                         RlpDecodeRule::EmptyList => match i {
-                            0xc0 => (RlpDecodeTypeTag::ShortString, false, 0),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
+                            0xc0 => (RlpDecodeTypeTag::ShortString, false),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                         RlpDecodeRule::LongList => match i {
-                            0xf8 => (RlpDecodeTypeTag::LongList1, true, 2),
-                            0xf9 => (RlpDecodeTypeTag::LongList2, true, 3),
-                            0xfa => (RlpDecodeTypeTag::LongList3, true, 4),
-                            _ => (RlpDecodeTypeTag::DoNothing, false, 0),
+                            0xf8 => (RlpDecodeTypeTag::LongList1, true),
+                            0xf9 => (RlpDecodeTypeTag::LongList2, true),
+                            0xfa => (RlpDecodeTypeTag::LongList3, true),
+                            _ => (RlpDecodeTypeTag::DoNothing, false),
                         },
                     };
                     [
@@ -104,10 +114,9 @@ impl RlpDecodeRule {
                         rlp_type as u64,
                         i,
                         decodable as u64,
-                        length,
                     ]
                 })
-                .collect::<Vec<[u64; 6]>>()
+                .collect::<Vec<[u64; 5]>>()
         };
 
         let mut offset = offset;
@@ -121,7 +130,6 @@ impl RlpDecodeRule {
                     table.rlp_type,
                     table.byte_0,
                     table.decodable,
-                    table.length,
                 ])
                 .try_for_each(|(value, col)| {
                     region
@@ -181,7 +189,7 @@ impl RlpDecoderTable {
         challenges: &Challenges<Value<F>>,
     ) -> Result<(), Error> {
         // make a list with all member of rlpTxFieldTag literally
-        let rlp_tx_field_tag_list: Vec<(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRule)> = vec![
+        let rlp_tx_field_decode_rules: Vec<(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRule)> = vec![
             (
                 RlpTxTypeTag::TxLegacyType,
                 RlpTxFieldTag::TxListRlpHeader,
@@ -253,7 +261,7 @@ impl RlpDecoderTable {
             || "load rlp decoder table",
             |mut region| {
                 let mut offset = 0;
-                for (tx_type, tx_field_tag, decode_rule) in rlp_tx_field_tag_list.iter() {
+                for (tx_type, tx_field_tag, decode_rule) in rlp_tx_field_decode_rules.iter() {
                     decode_rule.load(tx_type, tx_field_tag, self, &mut region, offset)?;
                     offset += 256;
                 }

@@ -313,7 +313,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         }
 
         // TODO: lookup bytes range table
-        // TODO: lookup q_fields table
 
         // lookup rlp_types table
         // TODO: bytes[1] as prefix of len also need to be constrainted
@@ -1189,7 +1188,7 @@ fn generate_rlp_type_witness(header_byte: u8) -> (RlpDecodeTypeTag, bool) {
         0xfa => RlpDecodeTypeTag::LongList3,
         _ => {
             decodable = false;
-            RlpDecodeTypeTag::NullValue
+            RlpDecodeTypeTag::DoNothing
         }
     };
     (rlp_type, decodable)
@@ -1234,7 +1233,8 @@ fn generate_rlp_row_witness<F: Field>(
                     rlp_remain_length: prev_rlp_remain_length - MAX_BYTE_COLUMN_NUM,
                     value: F::zero(),
                     acc_rlc_value: F::zero(),
-                    bytes: raw_bytes[..MAX_BYTE_COLUMN_NUM].to_vec(),
+                    bytes: raw_bytes[raw_bytes_offset..raw_bytes_offset + MAX_BYTE_COLUMN_NUM]
+                        .to_vec(),
                     decodable: decodable,
                     valid: true,
                     q_enable: true,
@@ -1635,7 +1635,7 @@ impl From<MockTransaction> for SignedTransaction {
                 s: mock_tx.s.expect("tx expected to be signed"),
                 v: mock_tx.v.expect("tx expected to be signed").as_u64(),
             };
-            let (rlp_unsigned, rlp_signed) = {
+            let (_rlp_unsigned, _rlp_signed) = {
                 let mut legacy_tx = TransactionRequest::new()
                     .from(mock_tx.from.address())
                     .nonce(mock_tx.nonce)
