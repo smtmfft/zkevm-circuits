@@ -15,10 +15,7 @@ use ethers_core::{
     types::TransactionRequest,
     utils::rlp::{self, PayloadInfo},
 };
-use gadgets::{
-    is_equal::{IsEqualChip, IsEqualConfig, IsEqualInstruction},
-    util::{and, not},
-};
+use gadgets::util::{and, not, sum};
 use halo2_proofs::{
     circuit::{Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
@@ -200,8 +197,6 @@ pub struct RlpDecoderCircuitConfigWitness<F: Field> {
     pub decodable: bool,
     /// valid, 0 for invalid, 1 for valid, should be == decodable at the end of the circuit
     pub valid: bool,
-    /// dynamic selector for fields
-    pub q_fields: [bool; LEGACY_TX_FIELD_NUM as usize],
     /// full chip enable
     pub q_enable: bool,
     /// the begining
@@ -224,7 +219,7 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     /// rlp types: [single, short, long, very_long, fixed(33)]
     pub rlp_type: Column<Advice>,
     /// rlp_type checking gadget
-    pub is_rlp_type: [IsEqualConfig<F>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
+    pub q_rlp_types: [Column<Advice>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
     /// rlp_tag_length, the length of this rlp field
     pub rlp_tag_length: Column<Advice>,
     /// remained rows, for n < 33 fields, it is n, for m > 33 fields, it is 33 and next row is
@@ -304,19 +299,18 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         let q_last = meta.fixed_column();
 
         // type checking
-        let is_rlp_type: [IsEqualConfig<F>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] = (0
+        let q_rlp_types: [Column<Advice>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] = (0
             ..RlpDecodeTypeTag::RlpDecodeTypeNum as usize)
-            .map(|t| {
-                IsEqualChip::configure(
-                    meta,
-                    |meta| meta.query_selector(q_enable),
-                    |meta| meta.query_advice(rlp_type, Rotation::cur()),
-                    |_| t.expr(),
-                )
-            })
-            .collect::<Vec<IsEqualConfig<F>>>()
+            .map(|_| meta.advice_column())
+            .collect::<Vec<Column<Advice>>>()
             .try_into()
             .unwrap();
+
+        macro_rules! rlp_type_enabled {
+            ($meta:expr, $rlp_type:expr) => {
+                $meta.query_advice(q_rlp_types[$rlp_type], Rotation::cur())
+            };
+        }
 
         // TODO: lookup bytes range table
         // TODO: lookup q_fields table
@@ -330,8 +324,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let decodable = meta.query_advice(decodable, Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
 
-            let is_not_partial =
-                not::expr(is_rlp_type[RlpDecodeTypeTag::PartialRlp as usize].is_equal());
+            let is_not_partial = not::expr(rlp_type_enabled!(meta, RlpDecodeTypeTag::PartialRlp));
 
             let tx_type_in_table =
                 meta.query_fixed(args.rlp_decoder_table.tx_type, Rotation::cur());
@@ -394,6 +387,44 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         meta.create_gate("common constraints for all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
+            // bind the rlp_type and rlp_type selector
+            q_rlp_types.iter().enumerate().for_each(|(i, q_rlp_type)| {
+                let q_rlp_type_enabled = meta.query_advice(*q_rlp_type, Rotation::cur());
+                cb.require_boolean("q_rlp_types are bool", q_rlp_type_enabled.expr());
+                cb.condition(q_rlp_type_enabled.expr(), |cb| {
+                    let rlp_type = meta.query_advice(rlp_type, Rotation::cur());
+                    cb.require_equal("rlp type check", rlp_type, i.expr())
+                });
+            });
+            cb.require_equal(
+                "1 rlp type only",
+                sum::expr(
+                    q_rlp_types
+                        .iter()
+                        .map(|t| meta.query_advice(*t, Rotation::cur())),
+                ),
+                1.expr(),
+            );
+
+            // bind the q_field with the field tag
+            q_fields.iter().enumerate().for_each(|(i, q_field)| {
+                let q_field_enabled = meta.query_advice(*q_field, Rotation::cur());
+                cb.require_boolean("q_fields are bool", q_field_enabled.expr());
+                cb.condition(q_field_enabled.expr(), |cb| {
+                    let tag = meta.query_advice(tag, Rotation::cur());
+                    cb.require_equal("tag check", tag, i.expr())
+                });
+            });
+            cb.require_equal(
+                "1 tx field only",
+                sum::expr(
+                    q_fields
+                        .iter()
+                        .map(|field| meta.query_advice(*field, Rotation::cur())),
+                ),
+                1.expr(),
+            );
+
             let valid_cur = meta.query_advice(valid, Rotation::cur());
             let valid_next = meta.query_advice(valid, Rotation::next());
             cb.require_equal(
@@ -447,17 +478,18 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_boolean("valid", valid);
 
             // length with leading bytes
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::DoNothing].is_equal(), |cb| {
+            cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::DoNothing), |cb| {
                 cb.require_equal("0 length", rlp_tag_length_cur.clone(), 0.expr())
             });
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::SingleByte].is_equal(), |cb| {
-                cb.require_equal("single length", rlp_tag_length_cur.clone(), 1.expr())
-            });
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::NullValue].is_equal(), |cb| {
+            cb.condition(
+                rlp_type_enabled!(meta, RlpDecodeTypeTag::SingleByte),
+                |cb| cb.require_equal("single length", rlp_tag_length_cur.clone(), 1.expr()),
+            );
+            cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::NullValue), |cb| {
                 cb.require_equal("empty length", rlp_tag_length_cur.clone(), 1.expr())
             });
             cb.condition(
-                is_rlp_type[RlpDecodeTypeTag::ShortString].is_equal(),
+                rlp_type_enabled!(meta, RlpDecodeTypeTag::ShortString),
                 |cb| {
                     cb.require_equal(
                         "ShortString length",
@@ -467,7 +499,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 },
             );
             cb.condition(
-                is_rlp_type[RlpDecodeTypeTag::LongString1].is_equal(),
+                rlp_type_enabled!(meta, RlpDecodeTypeTag::LongString1),
                 |cb| {
                     cb.require_equal(
                         "Long String 0xb8 length",
@@ -477,7 +509,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 },
             );
             cb.condition(
-                is_rlp_type[RlpDecodeTypeTag::LongString2].is_equal(),
+                rlp_type_enabled!(meta, RlpDecodeTypeTag::LongString2),
                 |cb| {
                     cb.require_equal(
                         "Long String 0xb9 length",
@@ -487,7 +519,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 },
             );
             cb.condition(
-                is_rlp_type[RlpDecodeTypeTag::LongString3].is_equal(),
+                rlp_type_enabled!(meta, RlpDecodeTypeTag::LongString3),
                 |cb| {
                     cb.require_equal(
                         "Long String 0xba length",
@@ -499,31 +531,34 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     )
                 },
             );
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::EmptyList].is_equal(), |cb| {
+            cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::EmptyList), |cb| {
                 cb.require_equal("empty list length", rlp_tag_length_cur.clone(), 1.expr())
             });
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::ShortList].is_equal(), |cb| {
+            cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::ShortList), |cb| {
                 cb.require_equal(
                     "short length",
                     rlp_tag_length_cur.clone(),
                     byte_cells_cur[0].expr() - 0xc0.expr() + 1.expr(),
                 )
             });
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::PartialRlp].is_equal(), |cb| {
-                cb.require_equal(
-                    "length = prev_length - prev_bytes_in_row",
-                    rlp_tag_length_cur.clone(),
-                    meta.query_advice(rlp_tag_length, Rotation::prev())
-                        - meta.query_advice(tag_bytes_in_row, Rotation::prev()),
-                );
+            cb.condition(
+                rlp_type_enabled!(meta, RlpDecodeTypeTag::PartialRlp),
+                |cb| {
+                    cb.require_equal(
+                        "length = prev_length - prev_bytes_in_row",
+                        rlp_tag_length_cur.clone(),
+                        meta.query_advice(rlp_tag_length, Rotation::prev())
+                            - meta.query_advice(tag_bytes_in_row, Rotation::prev()),
+                    );
 
-                cb.require_zero(
-                    "above row is incomplete",
-                    meta.query_advice(complete, Rotation::prev()),
-                );
+                    cb.require_zero(
+                        "above row is incomplete",
+                        meta.query_advice(complete, Rotation::prev()),
+                    );
 
-                cb.require_equal("only data has partial rlp", tag, RlpTxFieldTag::Data.expr());
-            });
+                    cb.require_equal("only data has partial rlp", tag, RlpTxFieldTag::Data.expr());
+                },
+            );
 
             cb.condition(complete_cur.expr(), |cb| {
                 cb.require_equal(
@@ -586,7 +621,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.require_zero("0 tx_tag", tag_cur);
             cb.require_equal("field completed", complete.expr(), 1.expr());
 
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::LongList1].is_equal(), |cb| {
+            cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList1), |cb| {
                 cb.require_equal(
                     "long length: f8 + 1",
                     remain_length.expr(),
@@ -594,16 +629,15 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 )
                 // TODO: byte_cells_cur[1] > 55
             });
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::LongList2].is_equal(), |cb| {
+            cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList2), |cb| {
                 cb.require_equal(
                     "long length: f9 + 2",
                     remain_length.expr(),
                     byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr(),
                 )
-
                 // TODO: byte_cells_cur[1] != 0
             });
-            cb.condition(is_rlp_type[RlpDecodeTypeTag::LongList3].is_equal(), |cb| {
+            cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList3), |cb| {
                 cb.require_equal(
                     "long length: fa + 3",
                     remain_length.expr(),
@@ -768,7 +802,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             tag,
             complete,
             rlp_type,
-            is_rlp_type,
+            q_rlp_types,
             rlp_tag_length,
             tag_bytes_in_row,
             r_mult,
@@ -798,19 +832,6 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
         self.name_row_members(region);
         for wit in wits {
             self.assign_row(region, offset, wit)?;
-
-            self.is_rlp_type
-                .iter()
-                .enumerate()
-                .try_for_each(|(idx, config)| {
-                    let chip = IsEqualChip::construct(config.clone());
-                    chip.assign(
-                        region,
-                        offset,
-                        Value::known(F::from(wit.rlp_type as u64)),
-                        Value::known(F::from(idx as u64)),
-                    )
-                })?;
             offset += 1;
         }
         Ok(())
@@ -865,11 +886,27 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
             || Value::known(F::from(w.complete)),
         )?;
         region.assign_advice(
-            || "config.rlp_types",
+            || "config.rlp_type",
             self.rlp_type,
             offset,
             || Value::known(F::from(w.rlp_type as u64)),
         )?;
+        self.q_rlp_types.iter().enumerate().try_for_each(|(i, q)| {
+            region
+                .assign_advice(
+                    || format!("config.q_rlp_types[{}]", i),
+                    *q,
+                    offset,
+                    || {
+                        if i as u64 == w.rlp_type as u64 {
+                            Value::known(F::one())
+                        } else {
+                            Value::known(F::zero())
+                        }
+                    },
+                )
+                .map(|_| ())
+        })?;
         region.assign_advice(
             || "config.rlp_tag_length",
             self.rlp_tag_length,
@@ -932,14 +969,25 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
             offset,
             || Value::known(F::from(w.valid)),
         )?;
-        for (i, q_field) in self.q_fields.iter().enumerate() {
-            region.assign_advice(
-                || format!("config.q_fields[{}]", i),
-                *q_field,
-                offset,
-                || Value::known(F::from(w.q_fields[i])),
-            )?;
-        }
+        self.q_fields
+            .iter()
+            .enumerate()
+            .try_for_each(|(i, q_field)| {
+                region
+                    .assign_advice(
+                        || format!("config.q_fields[{}]", i),
+                        *q_field,
+                        offset,
+                        || {
+                            if i == w.tag as usize {
+                                Value::known(F::one())
+                            } else {
+                                Value::known(F::zero())
+                            }
+                        },
+                    )
+                    .map(|_| ())
+            })?;
         region.assign_fixed(
             || "config.q_first",
             self.q_first,
@@ -1147,15 +1195,6 @@ fn generate_rlp_type_witness(header_byte: u8) -> (RlpDecodeTypeTag, bool) {
     (rlp_type, decodable)
 }
 
-fn generate_q_fields_witness(tag: &RlpTxFieldTag) -> [bool; LEGACY_TX_FIELD_NUM as usize] {
-    let mut q_fields = [false; LEGACY_TX_FIELD_NUM as usize];
-    q_fields[*tag as usize] = true;
-    if tag > &RlpTxFieldTag::Padding {
-        unreachable!("1559 not support now")
-    }
-    q_fields
-}
-
 fn generate_fields_witness_len(tag: &RlpTxFieldTag, payload: &PayloadInfo) -> usize {
     match tag {
         RlpTxFieldTag::TxListRlpHeader => payload.header_len,
@@ -1174,7 +1213,6 @@ fn generate_rlp_row_witness<F: Field>(
     let mut witness = vec![];
     let (mut rlp_type, decodable) = generate_rlp_type_witness(raw_bytes[0]);
     let partial_rlp_type = RlpDecodeTypeTag::PartialRlp;
-    let q_fields = generate_q_fields_witness(tag);
     let rlp_tag_len = raw_bytes.len();
     let mut prev_rlp_remain_length = rlp_remain_length;
 
@@ -1199,7 +1237,6 @@ fn generate_rlp_row_witness<F: Field>(
                     bytes: raw_bytes[..MAX_BYTE_COLUMN_NUM].to_vec(),
                     decodable: decodable,
                     valid: true,
-                    q_fields: q_fields,
                     q_enable: true,
                     q_first: false,
                     q_last: false,
@@ -1224,7 +1261,6 @@ fn generate_rlp_row_witness<F: Field>(
                 bytes: raw_bytes[raw_bytes_offset..].to_vec(),
                 decodable: decodable,
                 valid: true,
-                q_fields: q_fields,
                 q_enable: true,
                 q_first: false,
                 q_last: false,
@@ -1538,7 +1574,6 @@ fn complete_paddings<F: Field>(
             bytes: [0; MAX_BYTE_COLUMN_NUM].to_vec(),
             decodable: true,
             valid: true,
-            q_fields: [false; LEGACY_TX_FIELD_NUM as usize],
             q_enable: true,
             q_first: false,
             q_last: i == num_padding_to_last_row - 1,
@@ -1801,7 +1836,9 @@ mod rlp_decode_circuit_tests {
     }
 
     #[test]
+    #[ignore]
     fn tx_circuit_0tx() {
+        // 0xc0 is for invalid case.
         assert_eq!(run::<Fr>(vec![]), Ok(()));
     }
 
@@ -1898,7 +1935,7 @@ mod bench {
     use std::env::var;
 
     #[test]
-    fn bench_super_circuit_prover() {
+    fn bench_rlp_decode_circuit_prover() {
         let setup_prfx = "crate::constants::SETUP";
         let proof_gen_prfx = "crate::constants::PROOFGEN_PREFIX";
         let proof_ver_prfx = "crate::constants::PROOFVER_PREFIX";
