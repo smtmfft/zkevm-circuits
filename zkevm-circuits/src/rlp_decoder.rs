@@ -173,16 +173,16 @@ pub struct RlpDecoderCircuitConfigWitness<F: Field> {
     /// tx_type column
     pub tx_type: RlpTxTypeTag,
     /// tag column
-    pub tag: RlpTxFieldTag,
+    pub tx_member: RlpTxFieldTag,
     /// complete column
     pub complete: bool,
     /// rlp types: [single, short, long, very_long, fixed(33)]
     pub rlp_type: RlpDecodeTypeTag,
     /// rlp_tag_length, the length of this rlp field
-    pub rlp_tag_length: u64,
+    pub rlp_tx_member_length: u64,
     /// remained rows, for n < 33 fields, it is n, for m > 33 fields, it is 33 and next row is
     /// partial, next_length = m - 33
-    pub tag_bytes_in_row: u8,
+    pub rlp_bytes_in_row: u8,
     /// r_mult column, (length, r_mult) => @fixed
     pub r_mult: F,
     /// remain_length
@@ -213,7 +213,7 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     /// tx_type column
     pub tx_type: Column<Advice>,
     /// tag column
-    pub tag: Column<Advice>,
+    pub tx_member: Column<Advice>,
     /// complete column
     pub complete: Column<Advice>,
     /// rlp types: [single, short, long, very_long, fixed(33)]
@@ -221,13 +221,13 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     /// rlp_type checking gadget
     pub q_rlp_types: [Column<Advice>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize],
     /// rlp_tag_length, the length of this rlp field
-    pub rlp_tag_length: Column<Advice>,
+    pub rlp_tx_member_length: Column<Advice>,
     /// remained rows, for n < 33 fields, it is n, for m > 33 fields, it is 33 and next row is
     /// partial, next_length = m - 33
-    pub tag_bytes_in_row: Column<Advice>,
+    pub rlp_bytes_in_row: Column<Advice>,
     /// r_mult column, (length, r_mult) => @fixed
     pub r_mult: Column<Advice>,
-    /// remain_length
+    /// remain_length, to be 0 at the end.
     pub rlp_remain_length: Column<Advice>,
     /// value
     pub value: Column<Advice>,
@@ -240,7 +240,7 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     /// valid, 0 for invalid, 1 for valid, should be == decodable at the end of the circuit
     pub valid: Column<Advice>,
     /// dynamic selector for fields
-    pub q_fields: [Column<Advice>; LEGACY_TX_FIELD_NUM as usize],
+    pub q_tx_members: [Column<Advice>; LEGACY_TX_FIELD_NUM as usize],
     /// full chip enable
     pub q_enable: Selector,
     /// the begining
@@ -273,11 +273,11 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
     fn new(meta: &mut ConstraintSystem<F>, args: Self::ConfigArgs) -> Self {
         let tx_id = meta.advice_column();
         let tx_type = meta.advice_column();
-        let tag = meta.advice_column();
+        let tx_member = meta.advice_column();
         let complete = meta.advice_column();
         let rlp_type = meta.advice_column();
-        let rlp_tag_length = meta.advice_column();
-        let tag_bytes_in_row = meta.advice_column();
+        let rlp_tx_member_length = meta.advice_column();
+        let tx_member_bytes_in_row = meta.advice_column();
         let rlp_remain_length = meta.advice_column();
         let r_mult = meta.advice_column();
         let value = meta.advice_column();
@@ -289,7 +289,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             .unwrap();
         let decodable = meta.advice_column();
         let valid = meta.advice_column();
-        let q_fields: [Column<Advice>; LEGACY_TX_FIELD_NUM as usize] = (0..LEGACY_TX_FIELD_NUM)
+        let q_tx_members: [Column<Advice>; LEGACY_TX_FIELD_NUM as usize] = (0..LEGACY_TX_FIELD_NUM)
             .map(|_| meta.advice_column())
             .collect::<Vec<Column<Advice>>>()
             .try_into()
@@ -318,7 +318,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         // TODO: bytes[1] as prefix of len also need to be constrainted
         meta.lookup_any("rlp decodable check", |meta| {
             let tx_type = meta.query_advice(tx_type, Rotation::cur());
-            let tag = meta.query_advice(tag, Rotation::cur());
+            let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
             let byte0 = meta.query_advice(bytes[0], Rotation::cur());
             let decodable = meta.query_advice(decodable, Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
@@ -327,7 +327,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             let tx_type_in_table =
                 meta.query_fixed(args.rlp_decoder_table.tx_type, Rotation::cur());
-            let tag_in_table =
+            let tx_member_in_table =
                 meta.query_fixed(args.rlp_decoder_table.tx_field_tag, Rotation::cur());
             let byte0_in_table = meta.query_fixed(args.rlp_decoder_table.byte_0, Rotation::cur());
             let decodable_in_table =
@@ -337,7 +337,10 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     q_enable.expr() * is_not_partial.expr() * tx_type,
                     tx_type_in_table,
                 ),
-                (q_enable.expr() * is_not_partial.expr() * tag, tag_in_table),
+                (
+                    q_enable.expr() * is_not_partial.expr() * tx_member_cur,
+                    tx_member_in_table,
+                ),
                 (
                     q_enable.expr() * is_not_partial.expr() * byte0,
                     byte0_in_table,
@@ -351,23 +354,23 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
         // // lookup tx_field_switch table
         meta.lookup_any("rlp tx field transition", |meta| {
-            let current_field = meta.query_advice(tag, Rotation::cur());
-            let next_filed = meta.query_advice(tag, Rotation::next());
-            let current_field_in_table =
+            let current_member = meta.query_advice(tx_member, Rotation::cur());
+            let next_member = meta.query_advice(tx_member, Rotation::next());
+            let curr_member_in_table =
                 meta.query_fixed(args.tx_field_switch_table.current_tx_field, Rotation::cur());
-            let next_field_in_table =
+            let next_member_in_table =
                 meta.query_fixed(args.tx_field_switch_table.next_tx_field, Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
             let is_last = meta.query_fixed(q_last, Rotation::cur());
 
             vec![
                 (
-                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * current_field,
-                    current_field_in_table,
+                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * current_member,
+                    curr_member_in_table,
                 ),
                 (
-                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * next_filed,
-                    next_field_in_table,
+                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * next_member,
+                    next_member_in_table,
                 ),
             ]
         });
@@ -376,7 +379,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         // TODO: r_mult is adv, add constraint for pow
         meta.lookup_any("rlp r_mult check", |meta| {
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
-            let pow = meta.query_advice(tag_bytes_in_row, Rotation::cur());
+            let pow = meta.query_advice(tx_member_bytes_in_row, Rotation::cur());
             let r_mult_in_table = meta.query_fixed(args.r_mult_pow_table.r_mult, Rotation::cur());
             let r_pow_in_table = meta.query_fixed(args.r_mult_pow_table.length, Rotation::cur());
 
@@ -385,6 +388,20 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
         meta.create_gate("common constraints for all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
+
+            // boolean constraints
+            cb.require_boolean(
+                "field complete boolean",
+                meta.query_advice(complete, Rotation::cur()),
+            );
+            cb.require_boolean(
+                "decodable is boolean",
+                meta.query_advice(decodable, Rotation::cur()),
+            );
+            cb.require_boolean(
+                "valid is boolean",
+                meta.query_advice(valid, Rotation::cur()),
+            );
 
             // bind the rlp_type and rlp_type selector
             q_rlp_types.iter().enumerate().for_each(|(i, q_rlp_type)| {
@@ -406,18 +423,18 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             );
 
             // bind the q_field with the field tag
-            q_fields.iter().enumerate().for_each(|(i, q_field)| {
-                let q_field_enabled = meta.query_advice(*q_field, Rotation::cur());
-                cb.require_boolean("q_fields are bool", q_field_enabled.expr());
-                cb.condition(q_field_enabled.expr(), |cb| {
-                    let tag = meta.query_advice(tag, Rotation::cur());
+            q_tx_members.iter().enumerate().for_each(|(i, q_member)| {
+                let q_member_enabled = meta.query_advice(*q_member, Rotation::cur());
+                cb.require_boolean("q_member are bool", q_member_enabled.expr());
+                cb.condition(q_member_enabled.expr(), |cb| {
+                    let tag = meta.query_advice(tx_member, Rotation::cur());
                     cb.require_equal("tag check", tag, i.expr())
                 });
             });
             cb.require_equal(
                 "1 tx field only",
                 sum::expr(
-                    q_fields
+                    q_tx_members
                         .iter()
                         .map(|field| meta.query_advice(*field, Rotation::cur())),
                 ),
@@ -444,37 +461,25 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             ]))
         });
 
-        // common logic for tx fields
-        meta.create_gate("tx fields common constraints", |meta| {
+        // common logic for tx members
+        meta.create_gate("tx members common constraints", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
-            let tag = meta.query_advice(tag, Rotation::cur());
+            let tag = meta.query_advice(tx_member, Rotation::cur());
             let complete_cur = meta.query_advice(complete, Rotation::cur());
-            let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
+            let rlp_tag_length_cur = meta.query_advice(rlp_tx_member_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
-            let tag_bytes_in_row_cur = meta.query_advice(tag_bytes_in_row, Rotation::cur());
+            let bytes_in_row_cur = meta.query_advice(tx_member_bytes_in_row, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
             let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let valid = meta.query_advice(valid, Rotation::cur());
-            let q_fields: Vec<Expression<F>> = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
+            let q_tx_rlp_header =
+                meta.query_advice(q_tx_members[RlpTxFieldTag::TxRlpHeader], Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
             let q_first = meta.query_fixed(q_first, Rotation::cur());
-
-            // cb.require_boolean("q_enable boolean", q_enable);
-            cb.require_boolean("field complete boolean", complete_cur.expr());
-            q_fields.iter().for_each(|q_col| {
-                cb.require_boolean("q_fields boolean", q_col.expr());
-            });
-            cb.require_boolean("decodable", decodable);
-            cb.require_boolean("valid", valid);
 
             // length with leading bytes
             cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::DoNothing), |cb| {
@@ -546,8 +551,8 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     cb.require_equal(
                         "length = prev_length - prev_bytes_in_row",
                         rlp_tag_length_cur.clone(),
-                        meta.query_advice(rlp_tag_length, Rotation::prev())
-                            - meta.query_advice(tag_bytes_in_row, Rotation::prev()),
+                        meta.query_advice(rlp_tx_member_length, Rotation::prev())
+                            - meta.query_advice(tx_member_bytes_in_row, Rotation::prev()),
                     );
 
                     cb.require_zero(
@@ -562,7 +567,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.condition(complete_cur.expr(), |cb| {
                 cb.require_equal(
                     "complete = 1 => rlp_tag_length = bytes_in_row",
-                    tag_bytes_in_row_cur.expr(),
+                    bytes_in_row_cur.expr(),
                     rlp_tag_length_cur.expr(),
                 );
 
@@ -570,14 +575,14 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     "rlp_remain_length = rlp_remain_length.prev - length",
                     remain_length.expr(),
                     meta.query_advice(rlp_remain_length, Rotation::prev())
-                        - tag_bytes_in_row_cur.expr(),
+                        - bytes_in_row_cur.expr(),
                 );
             });
 
             cb.condition(not::expr(complete_cur.expr()), |cb| {
                 cb.require_equal(
                     "!complete => MAX_BYTES_COL == bytes_in_row",
-                    tag_bytes_in_row_cur.expr(),
+                    bytes_in_row_cur.expr(),
                     MAX_BYTE_COLUMN_NUM.expr(),
                 );
             });
@@ -592,7 +597,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.gate(and::expr([
                 q_enable,
                 not::expr(q_first),
-                not::expr(q_fields[RlpTxFieldTag::TxRlpHeader].expr()),
+                not::expr(q_tx_rlp_header),
             ]))
         });
 
@@ -602,9 +607,9 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             let tx_id = meta.query_advice(tx_id, Rotation::cur());
             let tx_type_cur = meta.query_advice(tx_type, Rotation::cur());
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
+            let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
             let complete = meta.query_advice(complete, Rotation::cur());
-            let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
+            let rlp_tag_length_cur = meta.query_advice(rlp_tx_member_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
             let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
@@ -617,7 +622,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             cb.require_zero("0 tx_id", tx_id);
             cb.require_zero("0 tx_type", tx_type_cur.expr());
-            cb.require_zero("0 tx_tag", tag_cur);
+            cb.require_zero("0 tx_tag", tx_member_cur);
             cb.require_equal("field completed", complete.expr(), 1.expr());
 
             cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList1), |cb| {
@@ -671,10 +676,9 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let tx_id_cur = meta.query_advice(tx_id, Rotation::cur());
             let tx_id_prev = meta.query_advice(tx_id, Rotation::prev());
             let tx_type_cur = meta.query_advice(tx_type, Rotation::cur());
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let tag_next = meta.query_advice(tag, Rotation::next());
+            let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
             let complete = meta.query_advice(complete, Rotation::cur());
-            let rlp_tag_length_cur = meta.query_advice(rlp_tag_length, Rotation::cur());
+            let rlp_tag_length_cur = meta.query_advice(rlp_tx_member_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
@@ -682,34 +686,25 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
             let decodable = meta.query_advice(decodable, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
+            let q_tx_rlp_header =
+                meta.query_advice(q_tx_members[RlpTxFieldTag::TxRlpHeader], Rotation::cur());
 
             cb.require_equal(
                 "tx_id == tx_id_prev + 1",
                 tx_id_cur.expr(),
                 tx_id_prev.expr() + 1.expr(),
             );
-            cb.require_zero("legacy tx_type", tx_type_cur.expr());
+            cb.require_equal(
+                "legacy tx_type",
+                tx_type_cur.expr(),
+                RlpTxTypeTag::TxLegacyType.expr(),
+            );
             cb.require_equal(
                 "tag is tx header",
-                tag_cur,
+                tx_member_cur,
                 RlpTxFieldTag::TxRlpHeader.expr(),
             );
             cb.require_equal("field completed", complete.expr(), 1.expr());
-
-            // next should be nonce if legacy(0) or chain_id if 1559
-            cb.condition(not::expr(tx_type_cur.expr()), |cb| {
-                let tx_type_next = meta.query_advice(tx_type, Rotation::next());
-                cb.require_equal(
-                    "next tx is legacy",
-                    tx_type_next,
-                    RlpTxTypeTag::TxLegacyType.expr(),
-                );
-                cb.require_equal("next field is nonce", tag_next, RlpTxFieldTag::Nonce.expr());
-            });
 
             cb.condition(decodable, |cb| {
                 cb.require_equal(
@@ -726,16 +721,16 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     + rlc::expr(&byte_cells_cur, args.challenges.keccak_input()),
             );
 
-            cb.gate(q_fields[RlpTxFieldTag::TxRlpHeader].expr() * meta.query_selector(q_enable))
+            cb.gate(q_tx_rlp_header * meta.query_selector(q_enable))
         });
 
         // padding
         meta.create_gate("Padding", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
+            let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
             let complete = meta.query_advice(complete, Rotation::cur());
-            let length = meta.query_advice(rlp_tag_length, Rotation::cur());
+            let length = meta.query_advice(rlp_tx_member_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
             let acc_rlc_value = meta.query_advice(acc_rlc_value, Rotation::cur());
@@ -744,12 +739,10 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
             let q_last = meta.query_fixed(q_last, Rotation::cur());
-            let q_fields = q_fields
-                .iter()
-                .map(|q_col| meta.query_advice(*q_col, Rotation::cur()))
-                .collect::<Vec<_>>();
+            let q_padding =
+                meta.query_advice(q_tx_members[RlpTxFieldTag::Padding], Rotation::cur());
 
-            cb.require_equal("tag", tag_cur, RlpTxFieldTag::Padding.expr());
+            cb.require_equal("tag", tx_member_cur, RlpTxFieldTag::Padding.expr());
             cb.require_equal("field completed", complete.expr(), 1.expr());
             cb.require_zero("padding has no r_mult", r_mult);
             cb.require_zero("padding has no length", length);
@@ -763,19 +756,15 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 cb.require_zero("padding has no bytes", byte.expr());
             });
 
-            cb.gate(
-                q_fields[RlpTxFieldTag::Padding].expr()
-                    * not::expr(q_last)
-                    * meta.query_selector(q_enable),
-            )
+            cb.gate(q_padding.expr() * not::expr(q_last) * meta.query_selector(q_enable))
         });
 
         meta.create_gate("end logic", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
             let complete = meta.query_advice(complete, Rotation::cur());
-            let tag_cur = meta.query_advice(tag, Rotation::cur());
-            let length = meta.query_advice(rlp_tag_length, Rotation::cur());
+            let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
+            let length = meta.query_advice(rlp_tx_member_length, Rotation::cur());
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
             let acc_rlc_value = meta.query_advice(acc_rlc_value, Rotation::cur());
@@ -785,7 +774,11 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let q_last = meta.query_fixed(q_last, Rotation::cur());
 
             cb.require_equal("completed at last", complete, 1.expr());
-            cb.require_equal("padding at last", tag_cur, RlpTxFieldTag::Padding.expr());
+            cb.require_equal(
+                "padding at last",
+                tx_member_cur,
+                RlpTxFieldTag::Padding.expr(),
+            );
             cb.require_equal("padding has no r_mult", r_mult, 0.expr());
             cb.require_equal("padding has no length", length, 0.expr());
             cb.require_equal("padding has no remain length", remain_length, 0.expr());
@@ -798,12 +791,12 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         Self {
             tx_id,
             tx_type,
-            tag,
+            tx_member,
             complete,
             rlp_type,
             q_rlp_types,
-            rlp_tag_length,
-            tag_bytes_in_row,
+            rlp_tx_member_length,
+            rlp_bytes_in_row: tx_member_bytes_in_row,
             r_mult,
             rlp_remain_length,
             value,
@@ -811,7 +804,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             bytes,
             decodable,
             valid,
-            q_fields,
+            q_tx_members,
             q_enable,
             q_first,
             q_last,
@@ -839,10 +832,10 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
     fn name_row_members(&self, region: &mut Region<'_, F>) {
         region.name_column(|| "config.tx_id", self.tx_id);
         region.name_column(|| "config.tx_type", self.tx_type);
-        region.name_column(|| "config.tag", self.tag);
+        region.name_column(|| "config.tag", self.tx_member);
         region.name_column(|| "config.complete", self.complete);
         region.name_column(|| "config.rlp_types", self.rlp_type);
-        region.name_column(|| "config.rlp_tag_length", self.rlp_tag_length);
+        region.name_column(|| "config.rlp_tag_length", self.rlp_tx_member_length);
         region.name_column(|| "config.rlp_remain_length", self.rlp_remain_length);
         region.name_column(|| "config.r_mult", self.r_mult);
         region.name_column(|| "config.value", self.value);
@@ -874,9 +867,9 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
         )?;
         region.assign_advice(
             || "config.tag",
-            self.tag,
+            self.tx_member,
             offset,
-            || Value::known(F::from(w.tag as u64)),
+            || Value::known(F::from(w.tx_member as u64)),
         )?;
         region.assign_advice(
             || "config.complete",
@@ -908,15 +901,15 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
         })?;
         region.assign_advice(
             || "config.rlp_tag_length",
-            self.rlp_tag_length,
+            self.rlp_tx_member_length,
             offset,
-            || Value::known(F::from(w.rlp_tag_length)),
+            || Value::known(F::from(w.rlp_tx_member_length)),
         )?;
         region.assign_advice(
             || "config.tag_bytes_in_row",
-            self.tag_bytes_in_row,
+            self.rlp_bytes_in_row,
             offset,
-            || Value::known(F::from(w.tag_bytes_in_row as u64)),
+            || Value::known(F::from(w.rlp_bytes_in_row as u64)),
         )?;
         region.assign_advice(
             || "config.r_mult",
@@ -968,7 +961,7 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
             offset,
             || Value::known(F::from(w.valid)),
         )?;
-        self.q_fields
+        self.q_tx_members
             .iter()
             .enumerate()
             .try_for_each(|(i, q_field)| {
@@ -978,7 +971,7 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
                         *q_field,
                         offset,
                         || {
-                            if i == w.tag as usize {
+                            if i == w.tx_member as usize {
                                 Value::known(F::one())
                             } else {
                                 Value::known(F::zero())
@@ -1204,7 +1197,7 @@ fn generate_fields_witness_len(tag: &RlpTxFieldTag, payload: &PayloadInfo) -> us
 
 fn generate_rlp_row_witness<F: Field>(
     tx_id: u64,
-    tag: &RlpTxFieldTag,
+    tx_member: &RlpTxFieldTag,
     raw_bytes: &[u8],
     r: F,
     rlp_remain_length: usize,
@@ -1224,11 +1217,11 @@ fn generate_rlp_row_witness<F: Field>(
                 temp_witness_vec.push(RlpDecoderCircuitConfigWitness::<F> {
                     tx_id: tx_id,
                     tx_type: RlpTxTypeTag::TxLegacyType,
-                    tag: tag.clone(),
+                    tx_member: tx_member.clone(),
                     complete: false,
                     rlp_type: rlp_type,
-                    rlp_tag_length: tag_remain_length as u64,
-                    tag_bytes_in_row: MAX_BYTE_COLUMN_NUM as u8,
+                    rlp_tx_member_length: tag_remain_length as u64,
+                    rlp_bytes_in_row: MAX_BYTE_COLUMN_NUM as u8,
                     r_mult: r.pow(&[MAX_BYTE_COLUMN_NUM as u64, 0, 0, 0]),
                     rlp_remain_length: prev_rlp_remain_length - MAX_BYTE_COLUMN_NUM,
                     value: F::zero(),
@@ -1249,11 +1242,11 @@ fn generate_rlp_row_witness<F: Field>(
             temp_witness_vec.push(RlpDecoderCircuitConfigWitness::<F> {
                 tx_id: tx_id,
                 tx_type: RlpTxTypeTag::TxLegacyType,
-                tag: tag.clone(),
+                tx_member: tx_member.clone(),
                 complete: true,
                 rlp_type: rlp_type,
-                rlp_tag_length: tag_remain_length as u64,
-                tag_bytes_in_row: tag_remain_length as u8,
+                rlp_tx_member_length: tag_remain_length as u64,
+                rlp_bytes_in_row: tag_remain_length as u8,
                 r_mult: r.pow(&[tag_remain_length as u64, 0, 0, 0]),
                 rlp_remain_length: prev_rlp_remain_length - tag_remain_length,
                 value: F::zero(),
@@ -1270,7 +1263,7 @@ fn generate_rlp_row_witness<F: Field>(
     }
 
     // TODO: reorganize the match
-    match tag {
+    match tx_member {
         RlpTxFieldTag::TxListRlpHeader => witness.append(&mut generate_witness!()),
         RlpTxFieldTag::TxRlpHeader => witness.append(&mut generate_witness!()),
         RlpTxFieldTag::Nonce => witness.append(&mut generate_witness!()),
@@ -1552,7 +1545,7 @@ fn complete_paddings<F: Field>(
     let mut complete_witness = vec![];
     let mut pre_padding = RlpDecoderCircuitConfigWitness::<F>::default();
     pre_padding.rlp_remain_length =
-        witness[0].rlp_remain_length + witness[0].tag_bytes_in_row as usize;
+        witness[0].rlp_remain_length + witness[0].rlp_bytes_in_row as usize;
 
     complete_witness.push(pre_padding);
     witness[0].q_first = true;
@@ -1562,11 +1555,11 @@ fn complete_paddings<F: Field>(
         complete_witness.push(RlpDecoderCircuitConfigWitness::<F> {
             tx_id: 0,
             tx_type: RlpTxTypeTag::TxLegacyType,
-            tag: RlpTxFieldTag::Padding,
+            tx_member: RlpTxFieldTag::Padding,
             complete: true,
             rlp_type: RlpDecodeTypeTag::DoNothing,
-            rlp_tag_length: 0,
-            tag_bytes_in_row: 0,
+            rlp_tx_member_length: 0,
+            rlp_bytes_in_row: 0,
             r_mult: F::zero(),
             rlp_remain_length: 0,
             value: F::zero(),
