@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use crate::{
     evm_circuit::util::{constraint_builder::BaseConstraintBuilder, rlc},
     impl_expr,
-    rlp_decoder_tables::{RMultPowTable, RlpDecoderTable, TxFieldSwitchTable},
+    rlp_decoder_tables::{RlpDecoderFixedTable, RlpDecoderFixedTableTag},
     table::KeccakTable,
     util::{log2_ceil, Challenges, SubCircuit, SubCircuitConfig},
     witness,
@@ -36,6 +36,8 @@ pub use halo2_proofs::halo2curves::{
 use mock::MockTransaction;
 
 const NUM_BLINDING_ROWS: usize = 64;
+
+type RlpDecoderFixedTable6Columns = RlpDecoderFixedTable<6>;
 
 /// RlpDecodeTypeTag is used to index the flag of rlp decoding type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -254,12 +256,8 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
 #[derive(Clone, Debug)]
 /// Circuit configuration arguments
 pub struct RlpDecoderCircuitConfigArgs<F: Field> {
-    /// RlpDecoderTable
-    pub rlp_decoder_table: RlpDecoderTable,
-    /// state transition table
-    pub tx_field_switch_table: TxFieldSwitchTable,
-    /// r_mult pow table
-    pub r_mult_pow_table: RMultPowTable,
+    /// shared fixed tables
+    pub rlp_fixed_table: RlpDecoderFixedTable6Columns,
     /// KeccakTable
     pub keccak_table: KeccakTable,
     /// Challenges
@@ -312,7 +310,21 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             };
         }
 
-        // TODO: lookup bytes range table
+        bytes.iter().for_each(|byte| {
+            meta.lookup_any("rlp byte range check", |meta| {
+                let table_tag = meta.query_fixed(
+                    args.rlp_fixed_table.byte_range_table.table_tag,
+                    Rotation::cur(),
+                );
+
+                let value =
+                    meta.query_fixed(args.rlp_fixed_table.byte_range_table.value, Rotation::cur());
+                vec![
+                    (RlpDecoderFixedTableTag::Range256.expr(), table_tag.expr()),
+                    (meta.query_advice(*byte, Rotation::cur()), value.expr()),
+                ]
+            });
+        });
 
         // lookup rlp_types table
         // TODO: bytes[1] as prefix of len also need to be constrainted
@@ -325,30 +337,35 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             let is_not_partial = not::expr(rlp_type_enabled!(meta, RlpDecodeTypeTag::PartialRlp));
 
-            let tx_type_in_table =
-                meta.query_fixed(args.rlp_decoder_table.tx_type, Rotation::cur());
-            let tx_member_in_table =
-                meta.query_fixed(args.rlp_decoder_table.tx_field_tag, Rotation::cur());
-            let byte0_in_table = meta.query_fixed(args.rlp_decoder_table.byte_0, Rotation::cur());
-            let decodable_in_table =
-                meta.query_fixed(args.rlp_decoder_table.decodable, Rotation::cur());
+            let table_tag = meta.query_fixed(
+                args.rlp_fixed_table.tx_decode_table.table_tag,
+                Rotation::cur(),
+            );
+            let tx_type_in_table = meta.query_fixed(
+                args.rlp_fixed_table.tx_decode_table.tx_type,
+                Rotation::cur(),
+            );
+            let tx_member_in_table = meta.query_fixed(
+                args.rlp_fixed_table.tx_decode_table.tx_field_tag,
+                Rotation::cur(),
+            );
+            let byte0_in_table =
+                meta.query_fixed(args.rlp_fixed_table.tx_decode_table.byte_0, Rotation::cur());
+            let decodable_in_table = meta.query_fixed(
+                args.rlp_fixed_table.tx_decode_table.decodable,
+                Rotation::cur(),
+            );
+
+            let query_able = q_enable.expr() * is_not_partial.expr();
             vec![
                 (
-                    q_enable.expr() * is_not_partial.expr() * tx_type,
-                    tx_type_in_table,
+                    query_able.expr() * RlpDecoderFixedTableTag::RlpDecoderTable.expr(),
+                    table_tag,
                 ),
-                (
-                    q_enable.expr() * is_not_partial.expr() * tx_member_cur,
-                    tx_member_in_table,
-                ),
-                (
-                    q_enable.expr() * is_not_partial.expr() * byte0,
-                    byte0_in_table,
-                ),
-                (
-                    q_enable.expr() * is_not_partial.expr() * decodable,
-                    decodable_in_table,
-                ),
+                (query_able.expr() * tx_type, tx_type_in_table),
+                (query_able.expr() * tx_member_cur, tx_member_in_table),
+                (query_able.expr() * byte0, byte0_in_table),
+                (query_able.expr() * decodable, decodable_in_table),
             ]
         });
 
@@ -356,22 +373,30 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         meta.lookup_any("rlp tx field transition", |meta| {
             let current_member = meta.query_advice(tx_member, Rotation::cur());
             let next_member = meta.query_advice(tx_member, Rotation::next());
-            let curr_member_in_table =
-                meta.query_fixed(args.tx_field_switch_table.current_tx_field, Rotation::cur());
-            let next_member_in_table =
-                meta.query_fixed(args.tx_field_switch_table.next_tx_field, Rotation::cur());
+
+            let table_tag = meta.query_fixed(
+                args.rlp_fixed_table.tx_member_switch_table.table_tag,
+                Rotation::cur(),
+            );
+            let curr_member_in_table = meta.query_fixed(
+                args.rlp_fixed_table.tx_member_switch_table.current_tx_field,
+                Rotation::cur(),
+            );
+            let next_member_in_table = meta.query_fixed(
+                args.rlp_fixed_table.tx_member_switch_table.next_tx_field,
+                Rotation::cur(),
+            );
             let q_enable = meta.query_selector(q_enable);
             let is_last = meta.query_fixed(q_last, Rotation::cur());
 
+            let query_able = and::expr([not::expr(is_last.expr()), q_enable.expr()]);
             vec![
                 (
-                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * current_member,
-                    curr_member_in_table,
+                    query_able.expr() * RlpDecoderFixedTableTag::TxFieldSwitchTable.expr(),
+                    table_tag,
                 ),
-                (
-                    and::expr([not::expr(is_last.expr()), q_enable.expr()]) * next_member,
-                    next_member_in_table,
-                ),
+                (query_able.expr() * current_member, curr_member_in_table),
+                (query_able.expr() * next_member, next_member_in_table),
             ]
         });
 
@@ -380,10 +405,28 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         meta.lookup_any("rlp r_mult check", |meta| {
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let pow = meta.query_advice(tx_member_bytes_in_row, Rotation::cur());
-            let r_mult_in_table = meta.query_fixed(args.r_mult_pow_table.r_mult, Rotation::cur());
-            let r_pow_in_table = meta.query_fixed(args.r_mult_pow_table.length, Rotation::cur());
+            let table_tag = meta.query_fixed(
+                args.rlp_fixed_table.r_mult_pow_table.table_tag,
+                Rotation::cur(),
+            );
+            let r_mult_in_table = meta.query_fixed(
+                args.rlp_fixed_table.r_mult_pow_table.r_mult,
+                Rotation::cur(),
+            );
+            let r_pow_in_table = meta.query_fixed(
+                args.rlp_fixed_table.r_mult_pow_table.length,
+                Rotation::cur(),
+            );
 
-            vec![(r_mult, r_mult_in_table), (pow, r_pow_in_table)]
+            let q_enable = meta.query_selector(q_enable);
+            vec![
+                (
+                    q_enable.expr() * RlpDecoderFixedTableTag::RMult.expr(),
+                    table_tag,
+                ),
+                (q_enable.expr() * r_mult, r_mult_in_table),
+                (q_enable.expr() * pow, r_pow_in_table),
+            ]
         });
 
         meta.create_gate("common constraints for all rows", |meta| {
@@ -744,7 +787,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             cb.require_equal("tag", tx_member_cur, RlpTxFieldTag::Padding.expr());
             cb.require_equal("field completed", complete.expr(), 1.expr());
-            cb.require_zero("padding has no r_mult", r_mult);
+            cb.require_equal("padding has 1 r_mult", r_mult, 1.expr());
             cb.require_zero("padding has no length", length);
             cb.require_zero("padding has no remain length", remain_length);
             cb.require_zero(
@@ -756,34 +799,18 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 cb.require_zero("padding has no bytes", byte.expr());
             });
 
-            cb.gate(q_padding.expr() * not::expr(q_last) * meta.query_selector(q_enable))
+            cb.gate(q_padding.expr() * meta.query_selector(q_enable))
         });
 
-        meta.create_gate("end logic", |meta| {
+        meta.create_gate("end with padding", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
-            let complete = meta.query_advice(complete, Rotation::cur());
-            let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
-            let length = meta.query_advice(rlp_tx_member_length, Rotation::cur());
-            let r_mult = meta.query_advice(r_mult, Rotation::cur());
-            let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let acc_rlc_value = meta.query_advice(acc_rlc_value, Rotation::cur());
-            let decodable = meta.query_advice(decodable, Rotation::cur());
-            let valid = meta.query_advice(valid, Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
             let q_last = meta.query_fixed(q_last, Rotation::cur());
+            let q_padding =
+                meta.query_advice(q_tx_members[RlpTxFieldTag::Padding], Rotation::cur());
 
-            cb.require_equal("completed at last", complete, 1.expr());
-            cb.require_equal(
-                "padding at last",
-                tx_member_cur,
-                RlpTxFieldTag::Padding.expr(),
-            );
-            cb.require_equal("padding has no r_mult", r_mult, 0.expr());
-            cb.require_equal("padding has no length", length, 0.expr());
-            cb.require_equal("padding has no remain length", remain_length, 0.expr());
-            cb.require_equal("padding has no rlc (all 0)", acc_rlc_value, 0.expr());
-            cb.require_equal("valid == decodable", valid, decodable);
+            cb.require_equal("padding at last", q_padding, 1.expr());
 
             cb.gate(q_last * q_enable)
         });
@@ -1048,8 +1075,12 @@ impl<F: Field> RlpDecoderCircuit<F> {
     fn calc_min_num_rows(txs_len: usize, call_data_rows: usize) -> usize {
         // add 2 for prev and next rotations.
         let constraint_size = txs_len * LEGACY_TX_FIELD_NUM + call_data_rows + 2;
-        let tables_size =
-            RlpDecoderTable::table_size() + TxFieldSwitchTable::table_size() + MAX_BYTE_COLUMN_NUM;
+        let tables_size = RlpDecoderFixedTable6Columns::table_size();
+        log::info!(
+            "constraint_size: {}, tables_size: {}",
+            constraint_size,
+            tables_size
+        );
         constraint_size + tables_size + NUM_BLINDING_ROWS
     }
 }
@@ -1090,16 +1121,7 @@ impl<F: Field> SubCircuit<F> for RlpDecoderCircuit<F> {
         let witness: Vec<RlpDecoderCircuitConfigWitness<F>> =
             rlp_decode_tx_list_manually(&self.bytes, randomness, self.size as u32);
 
-        config.args.rlp_decoder_table.load(layouter, challenges)?;
-        config
-            .args
-            .tx_field_switch_table
-            .load(layouter, challenges)?;
-        config.args.r_mult_pow_table.load(layouter, challenges)?;
-        config
-            .args
-            .keccak_table
-            .dev_load(layouter, vec![&self.bytes], challenges)?;
+        config.args.rlp_fixed_table.load(layouter, challenges)?;
 
         layouter.assign_region(
             || "rlp witness region",
@@ -1127,9 +1149,7 @@ impl<F: Field> Circuit<F> for RlpDecoderCircuit<F> {
     }
 
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        let rlp_decoder_table = RlpDecoderTable::construct(meta);
-        let tx_field_switch_table = TxFieldSwitchTable::construct(meta);
-        let r_mult_pow_table = RMultPowTable::construct(meta);
+        let rlp_fixed_table = RlpDecoderFixedTable6Columns::construct(meta);
         let keccak_table = KeccakTable::construct(meta);
         let challenges = Challenges::construct(meta);
 
@@ -1140,9 +1160,7 @@ impl<F: Field> Circuit<F> for RlpDecoderCircuit<F> {
             RlpDecoderCircuitConfig::new(
                 meta,
                 RlpDecoderCircuitConfigArgs {
-                    rlp_decoder_table,
-                    tx_field_switch_table,
-                    r_mult_pow_table,
+                    rlp_fixed_table,
                     keccak_table,
                     challenges: challenges_expr,
                 },
@@ -1520,9 +1538,9 @@ fn rlp_decode_tx_list_manually<F: Field>(
         k as usize - witness_len - 2 - NUM_BLINDING_ROWS,
     );
 
-    // for iw in complete_witness.iter().enumerate() {
-    //     println!("witness[{}] {:?}", iw.0, iw.1);
-    // }
+    for iw in complete_witness.iter().enumerate() {
+        log::trace!("witness[{}] {:?}", iw.0, iw.1);
+    }
     complete_witness
 }
 
@@ -1560,7 +1578,7 @@ fn complete_paddings<F: Field>(
             rlp_type: RlpDecodeTypeTag::DoNothing,
             rlp_tx_member_length: 0,
             rlp_bytes_in_row: 0,
-            r_mult: F::zero(),
+            r_mult: F::one(),
             rlp_remain_length: 0,
             value: F::zero(),
             acc_rlc_value: F::zero(),
