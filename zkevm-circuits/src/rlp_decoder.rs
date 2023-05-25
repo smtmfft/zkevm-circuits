@@ -15,7 +15,10 @@ use ethers_core::{
     types::TransactionRequest,
     utils::rlp::{self, PayloadInfo},
 };
-use gadgets::util::{and, not, sum};
+use gadgets::{
+    less_than::{LtChip, LtConfig, LtInstruction},
+    util::{and, not, or, sum},
+};
 use halo2_proofs::{
     circuit::{Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
@@ -249,8 +252,12 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     pub q_first: Column<Fixed>,
     /// the end
     pub q_last: Column<Fixed>,
-    /// args
-    pub args: RlpDecoderCircuitConfigArgs<F>,
+    /// aux tables
+    pub aux_tables: RlpDecoderCircuitConfigArgs<F>,
+    /// condition check for <=55
+    pub v_gt_55: LtConfig<F, 1>,
+    /// condition check for > 0
+    pub v_gt_0: LtConfig<F, 1>,
 }
 
 #[derive(Clone, Debug)]
@@ -268,7 +275,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
     type ConfigArgs = RlpDecoderCircuitConfigArgs<F>;
 
     /// Return a new RlpDecoderCircuitConfig
-    fn new(meta: &mut ConstraintSystem<F>, args: Self::ConfigArgs) -> Self {
+    fn new(meta: &mut ConstraintSystem<F>, aux_tables: Self::ConfigArgs) -> Self {
         let tx_id = meta.advice_column();
         let tx_type = meta.advice_column();
         let tx_member = meta.advice_column();
@@ -310,15 +317,36 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             };
         }
 
+        let v_gt_55 = LtChip::configure(
+            meta,
+            |meta| {
+                rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList1) * meta.query_selector(q_enable)
+            },
+            |_| 55.expr(),
+            |meta| meta.query_advice(bytes[1], Rotation::cur()),
+        );
+
+        let v_gt_0 = LtChip::configure(
+            meta,
+            |meta| {
+                or::expr([
+                    rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList2),
+                    rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList3),
+                ]) * meta.query_selector(q_enable)
+            },
+            |_| 0.expr(),
+            |meta| meta.query_advice(bytes[1], Rotation::cur()),
+        );
+
+        /////////////////////////////////
+        //// lookups
+        //// /////////////////////////////
+        // bytes range check
         bytes.iter().for_each(|byte| {
             meta.lookup_any("rlp byte range check", |meta| {
-                let table_tag = meta.query_fixed(
-                    args.rlp_fixed_table.byte_range_table.table_tag,
-                    Rotation::cur(),
-                );
-
-                let value =
-                    meta.query_fixed(args.rlp_fixed_table.byte_range_table.value, Rotation::cur());
+                let table = &aux_tables.rlp_fixed_table.byte_range_table;
+                let table_tag = meta.query_fixed(table.table_tag, Rotation::cur());
+                let value = meta.query_fixed(table.value, Rotation::cur());
                 vec![
                     (RlpDecoderFixedTableTag::Range256.expr(), table_tag.expr()),
                     (meta.query_advice(*byte, Rotation::cur()), value.expr()),
@@ -337,24 +365,12 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             let is_not_partial = not::expr(rlp_type_enabled!(meta, RlpDecodeTypeTag::PartialRlp));
 
-            let table_tag = meta.query_fixed(
-                args.rlp_fixed_table.tx_decode_table.table_tag,
-                Rotation::cur(),
-            );
-            let tx_type_in_table = meta.query_fixed(
-                args.rlp_fixed_table.tx_decode_table.tx_type,
-                Rotation::cur(),
-            );
-            let tx_member_in_table = meta.query_fixed(
-                args.rlp_fixed_table.tx_decode_table.tx_field_tag,
-                Rotation::cur(),
-            );
-            let byte0_in_table =
-                meta.query_fixed(args.rlp_fixed_table.tx_decode_table.byte_0, Rotation::cur());
-            let decodable_in_table = meta.query_fixed(
-                args.rlp_fixed_table.tx_decode_table.decodable,
-                Rotation::cur(),
-            );
+            let table = &aux_tables.rlp_fixed_table.tx_decode_table;
+            let table_tag = meta.query_fixed(table.table_tag, Rotation::cur());
+            let tx_type_in_table = meta.query_fixed(table.tx_type, Rotation::cur());
+            let tx_member_in_table = meta.query_fixed(table.tx_field_tag, Rotation::cur());
+            let byte0_in_table = meta.query_fixed(table.byte_0, Rotation::cur());
+            let decodable_in_table = meta.query_fixed(table.decodable, Rotation::cur());
 
             let query_able = q_enable.expr() * is_not_partial.expr();
             vec![
@@ -374,18 +390,10 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let current_member = meta.query_advice(tx_member, Rotation::cur());
             let next_member = meta.query_advice(tx_member, Rotation::next());
 
-            let table_tag = meta.query_fixed(
-                args.rlp_fixed_table.tx_member_switch_table.table_tag,
-                Rotation::cur(),
-            );
-            let curr_member_in_table = meta.query_fixed(
-                args.rlp_fixed_table.tx_member_switch_table.current_tx_field,
-                Rotation::cur(),
-            );
-            let next_member_in_table = meta.query_fixed(
-                args.rlp_fixed_table.tx_member_switch_table.next_tx_field,
-                Rotation::cur(),
-            );
+            let table = &aux_tables.rlp_fixed_table.tx_member_switch_table;
+            let table_tag = meta.query_fixed(table.table_tag, Rotation::cur());
+            let curr_member_in_table = meta.query_fixed(table.current_tx_field, Rotation::cur());
+            let next_member_in_table = meta.query_fixed(table.next_tx_field, Rotation::cur());
             let q_enable = meta.query_selector(q_enable);
             let is_last = meta.query_fixed(q_last, Rotation::cur());
 
@@ -405,18 +413,11 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         meta.lookup_any("rlp r_mult check", |meta| {
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let pow = meta.query_advice(tx_member_bytes_in_row, Rotation::cur());
-            let table_tag = meta.query_fixed(
-                args.rlp_fixed_table.r_mult_pow_table.table_tag,
-                Rotation::cur(),
-            );
-            let r_mult_in_table = meta.query_fixed(
-                args.rlp_fixed_table.r_mult_pow_table.r_mult,
-                Rotation::cur(),
-            );
-            let r_pow_in_table = meta.query_fixed(
-                args.rlp_fixed_table.r_mult_pow_table.length,
-                Rotation::cur(),
-            );
+
+            let table = &aux_tables.rlp_fixed_table.r_mult_pow_table;
+            let table_tag = meta.query_fixed(table.table_tag, Rotation::cur());
+            let r_mult_in_table = meta.query_fixed(table.r_mult, Rotation::cur());
+            let r_pow_in_table = meta.query_fixed(table.length, Rotation::cur());
 
             let q_enable = meta.query_selector(q_enable);
             vec![
@@ -429,6 +430,9 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             ]
         });
 
+        /////////////////////////////////
+        //// constraints
+        //// /////////////////////////////
         meta.create_gate("common constraints for all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
@@ -634,7 +638,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
                 acc_rlc_cur,
                 r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
-                    + rlc::expr(&byte_cells_cur, args.challenges.keccak_input()),
+                    + rlc::expr(&byte_cells_cur, aux_tables.challenges.keccak_input()),
             );
 
             cb.gate(and::expr([
@@ -670,29 +674,33 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
 
             cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList1), |cb| {
                 cb.require_equal(
-                    "long length: f8 + 1",
+                    "long length 1 byte after 0xf8",
                     remain_length.expr(),
                     byte_cells_cur[1].expr(),
-                )
-                // TODO: byte_cells_cur[1] > 55
+                );
+
+                // TODO: byte_cells_cur[1] > 55, and check with len_decode flag
+                cb.require_equal("v should be >55", v_gt_55.is_lt(meta, None), 1.expr())
             });
             cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList2), |cb| {
                 cb.require_equal(
-                    "long length: f9 + 2",
+                    "long length 2 bytes after f9",
                     remain_length.expr(),
                     byte_cells_cur[1].expr() * 256.expr() + byte_cells_cur[2].expr(),
-                )
-                // TODO: byte_cells_cur[1] != 0
+                );
+                // TODO: byte_cells_cur[1] != 0, and check with len_decode flag
+                cb.require_equal("v should be >0", v_gt_0.is_lt(meta, None), 1.expr())
             });
             cb.condition(rlp_type_enabled!(meta, RlpDecodeTypeTag::LongList3), |cb| {
                 cb.require_equal(
-                    "long length: fa + 3",
+                    "long length 3 bytes after fa",
                     remain_length.expr(),
                     byte_cells_cur[1].expr() * 65536.expr()
                         + byte_cells_cur[2].expr() * 256.expr()
                         + byte_cells_cur[3].expr(),
-                )
-                // TODO: byte_cells_cur[1] != 0
+                );
+                // TODO: byte_cells_cur[1] != 0, and check with len_decode flag
+                cb.require_equal("v should be >0", v_gt_0.is_lt(meta, None), 1.expr())
             });
 
             cb.condition(decodable, |cb| {
@@ -707,7 +715,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
                 acc_rlc_cur,
                 r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
-                    + rlc::expr(&byte_cells_cur, args.challenges.keccak_input()),
+                    + rlc::expr(&byte_cells_cur, aux_tables.challenges.keccak_input()),
             );
 
             cb.gate(q_first)
@@ -761,7 +769,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
                 acc_rlc_cur,
                 r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
-                    + rlc::expr(&byte_cells_cur, args.challenges.keccak_input()),
+                    + rlc::expr(&byte_cells_cur, aux_tables.challenges.keccak_input()),
             );
 
             cb.gate(q_tx_rlp_header * meta.query_selector(q_enable))
@@ -781,7 +789,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
                 .collect::<Vec<_>>();
-            let q_last = meta.query_fixed(q_last, Rotation::cur());
             let q_padding =
                 meta.query_advice(q_tx_members[RlpTxFieldTag::Padding], Rotation::cur());
 
@@ -815,7 +822,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             cb.gate(q_last * q_enable)
         });
 
-        Self {
+        let circuit_config = RlpDecoderCircuitConfig {
             tx_id,
             tx_type,
             tx_member,
@@ -835,8 +842,11 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             q_enable,
             q_first,
             q_last,
-            args,
-        }
+            aux_tables,
+            v_gt_55,
+            v_gt_0,
+        };
+        circuit_config
     }
 }
 
@@ -850,6 +860,13 @@ impl<F: Field> RlpDecoderCircuitConfig<F> {
         let mut offset = offset;
         self.name_row_members(region);
         for wit in wits {
+            let gt_55_chip = LtChip::construct(self.v_gt_55);
+            let gt_0_chip = LtChip::construct(self.v_gt_0);
+
+            let leading_val = if wit.bytes.len() > 1 { wit.bytes[1] } else { 0 };
+            gt_55_chip.assign(region, offset, F::from(55u64), F::from(leading_val as u64))?;
+            gt_0_chip.assign(region, offset, F::zero(), F::from(leading_val as u64))?;
+
             self.assign_row(region, offset, wit)?;
             offset += 1;
         }
@@ -1121,7 +1138,10 @@ impl<F: Field> SubCircuit<F> for RlpDecoderCircuit<F> {
         let witness: Vec<RlpDecoderCircuitConfigWitness<F>> =
             rlp_decode_tx_list_manually(&self.bytes, randomness, self.size as u32);
 
-        config.args.rlp_fixed_table.load(layouter, challenges)?;
+        config
+            .aux_tables
+            .rlp_fixed_table
+            .load(layouter, challenges)?;
 
         layouter.assign_region(
             || "rlp witness region",
