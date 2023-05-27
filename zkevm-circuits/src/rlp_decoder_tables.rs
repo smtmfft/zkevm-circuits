@@ -30,6 +30,8 @@ pub enum RlpDecodeRule {
     Uint64,
     /// The RLP encoding type is a uint96
     Uint96,
+    /// The RLP encoding type is a uint256
+    Uint256,
     /// The RLP encoding type is a address 20bytes i.e., 0x94xxxx
     Address,
     /// The RLP encoding type is a hash string 32bytes, i.e., 0xa0xxx
@@ -68,6 +70,12 @@ impl RlpDecodeRule {
                 // 0 is error: non-canonical integer (leading zero bytes) for uint96
                 1..=0x80 => (RlpDecodeTypeTag::SingleByte, true),
                 0x81..=0x8c => (RlpDecodeTypeTag::ShortString, true),
+                _ => (RlpDecodeTypeTag::DoNothing, false),
+            },
+            RlpDecodeRule::Uint256 => match byte0 {
+                // 0 is error: non-canonical integer (leading zero bytes) for uint256
+                1..=0x80 => (RlpDecodeTypeTag::SingleByte, true),
+                0x81..=0xa0 => (RlpDecodeTypeTag::ShortString, true),
                 _ => (RlpDecodeTypeTag::DoNothing, false),
             },
             RlpDecodeRule::Address => match byte0 {
@@ -212,12 +220,12 @@ impl RlpDecoderTable {
             (
                 RlpTxTypeTag::TxLegacyType,
                 RlpTxFieldTag::SignR,
-                RlpDecodeRule::Bytes32,
+                RlpDecodeRule::Uint256,
             ),
             (
                 RlpTxTypeTag::TxLegacyType,
                 RlpTxFieldTag::SignS,
-                RlpDecodeRule::Bytes48K,
+                RlpDecodeRule::Uint256,
             ),
             (
                 RlpTxTypeTag::TxLegacyType,
