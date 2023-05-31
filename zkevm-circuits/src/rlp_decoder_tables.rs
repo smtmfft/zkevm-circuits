@@ -28,15 +28,14 @@ pub enum RlpDecodeRule {
     Empty,
     /// The RLP encoding type is a uint96
     Uint64,
-    /// The RLP encoding type is a uint96
+    /// The RLP encoding type is a uint96, for gas/nonce/price/ect
     Uint96,
-    /// The RLP encoding type is a uint256
+    /// The RLP encoding type is a uint256, normally for signature
     Uint256,
     /// The RLP encoding type is a address 20bytes i.e., 0x94xxxx
     Address,
-    /// The RLP encoding type is a hash string 32bytes, i.e., 0xa0xxx
-    Bytes32,
-    /// The RLP encoding type is a string which is upto 48k bytes
+    /// The RLP encoding type is a string which is upto 48k bytes, a exception is it accepts
+    /// leading 00
     Bytes48K,
     /// The RLP encoding empty list type
     EmptyList,
@@ -50,8 +49,8 @@ impl RlpDecodeRule {
     /// | legacy               | nonce | uint96   | 0x00    | false     |
     /// | legacy               | nonce | uint96   | 0x01    | true      |
     ///  ...
-    /// | legacy               | signS | byte32   | 0xa0    | true      |
-    /// | legacy               | signS | byte32   | 0xa1    | false     |
+    /// | legacy               | signS | uint256  | 0xa0    | true      |
+    /// | legacy               | signS | byte256  | 0xa1    | false     |
     ///  ...
     pub fn rule_check(&self, byte0: u8) -> (RlpDecodeTypeTag, bool) {
         let (rlp_type, decodable) = match self {
@@ -63,41 +62,36 @@ impl RlpDecodeRule {
             RlpDecodeRule::Uint64 => match byte0 {
                 // 0 is error: non-canonical integer (leading zero bytes) for uint64
                 1..=0x80 => (RlpDecodeTypeTag::SingleByte, true),
-                0x81..=0x88 => (RlpDecodeTypeTag::ShortString, true),
+                0x81..=0x88 => (RlpDecodeTypeTag::ShortStringValue, true),
                 _ => (RlpDecodeTypeTag::DoNothing, false),
             },
             RlpDecodeRule::Uint96 => match byte0 {
                 // 0 is error: non-canonical integer (leading zero bytes) for uint96
                 1..=0x80 => (RlpDecodeTypeTag::SingleByte, true),
-                0x81..=0x8c => (RlpDecodeTypeTag::ShortString, true),
+                0x81..=0x8c => (RlpDecodeTypeTag::ShortStringValue, true),
                 _ => (RlpDecodeTypeTag::DoNothing, false),
             },
             RlpDecodeRule::Uint256 => match byte0 {
                 // 0 is error: non-canonical integer (leading zero bytes) for uint256
                 1..=0x80 => (RlpDecodeTypeTag::SingleByte, true),
-                0x81..=0xa0 => (RlpDecodeTypeTag::ShortString, true),
+                0x81..=0xa0 => (RlpDecodeTypeTag::ShortStringValue, true),
                 _ => (RlpDecodeTypeTag::DoNothing, false),
             },
             RlpDecodeRule::Address => match byte0 {
-                0x94 => (RlpDecodeTypeTag::ShortString, true),
-                _ => (RlpDecodeTypeTag::DoNothing, false),
-            },
-            RlpDecodeRule::Bytes32 => match byte0 {
-                // TODO: what if sig is less then 32 bytes?
-                0xa0 => (RlpDecodeTypeTag::ShortString, true),
+                0x94 => (RlpDecodeTypeTag::ShortStringBytes, true),
                 _ => (RlpDecodeTypeTag::DoNothing, false),
             },
             RlpDecodeRule::Bytes48K => match byte0 {
                 0 => (RlpDecodeTypeTag::SingleByte, true),        // 0x00
                 1..=0x80 => (RlpDecodeTypeTag::SingleByte, true), // 0x01..=0x80
-                0x81..=0xb7 => (RlpDecodeTypeTag::ShortString, true),
+                0x81..=0xb7 => (RlpDecodeTypeTag::ShortStringBytes, true),
                 0xb8 => (RlpDecodeTypeTag::LongString1, true),
                 0xb9 => (RlpDecodeTypeTag::LongString2, true),
                 0xba => (RlpDecodeTypeTag::LongString3, true),
                 _ => (RlpDecodeTypeTag::DoNothing, false),
             },
             RlpDecodeRule::EmptyList => match byte0 {
-                0xc0 => (RlpDecodeTypeTag::ShortString, false),
+                0xc0 => (RlpDecodeTypeTag::EmptyList, false),
                 _ => (RlpDecodeTypeTag::DoNothing, false),
             },
             RlpDecodeRule::LongList => match byte0 {
@@ -110,6 +104,75 @@ impl RlpDecodeRule {
         (rlp_type, decodable)
     }
 }
+
+/// rules of tx members
+pub const RLP_TX_FIELD_DECODE_RULES: [(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRule); 13] = [
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::TxListRlpHeader,
+        RlpDecodeRule::LongList,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::TxRlpHeader,
+        RlpDecodeRule::LongList,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::Nonce,
+        RlpDecodeRule::Uint96,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::GasPrice,
+        RlpDecodeRule::Uint96,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::Gas,
+        RlpDecodeRule::Uint96,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::To,
+        RlpDecodeRule::Address,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::To,
+        RlpDecodeRule::Empty,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::Value,
+        RlpDecodeRule::Uint96,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::Data,
+        RlpDecodeRule::Bytes48K,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::SignV,
+        RlpDecodeRule::Uint96,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::SignR,
+        RlpDecodeRule::Uint256,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::SignS,
+        RlpDecodeRule::Uint256,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::Padding,
+        RlpDecodeRule::Padding,
+    ),
+];
 
 /// Table that contains the fields of all possible RLP decodable fields
 #[derive(Clone, Debug)]
@@ -166,81 +229,13 @@ impl RlpDecoderTable {
         _challenges: &Challenges<Value<F>>,
     ) -> Result<(), Error> {
         // make a list with all member of rlpTxFieldTag literally
-        let rlp_tx_field_decode_rules: Vec<(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRule)> = vec![
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::TxListRlpHeader,
-                RlpDecodeRule::LongList,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::TxRlpHeader,
-                RlpDecodeRule::LongList,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::Nonce,
-                RlpDecodeRule::Uint96,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::GasPrice,
-                RlpDecodeRule::Uint96,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::Gas,
-                RlpDecodeRule::Uint96,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::To,
-                RlpDecodeRule::Address,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::To,
-                RlpDecodeRule::Empty,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::Value,
-                RlpDecodeRule::Uint96,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::Data,
-                RlpDecodeRule::Bytes48K,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::SignV,
-                RlpDecodeRule::Uint96,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::SignR,
-                RlpDecodeRule::Uint256,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::SignS,
-                RlpDecodeRule::Uint256,
-            ),
-            (
-                RlpTxTypeTag::TxLegacyType,
-                RlpTxFieldTag::Padding,
-                RlpDecodeRule::Padding,
-            ),
-        ];
-
         layouter.assign_region(
             || "load rlp decoder table",
             |mut region| {
                 let mut offset = 0;
                 let table_tag = RlpDecoderFixedTableTag::RlpDecoderTable as u64;
 
-                for (tx_type, tx_field_tag, decode_rule) in rlp_tx_field_decode_rules.iter() {
+                for (tx_type, tx_field_tag, decode_rule) in RLP_TX_FIELD_DECODE_RULES.iter() {
                     for byte_val in 0..=255u8 {
                         let (rlp_type, decodable) = decode_rule.rule_check(byte_val);
                         let rule_table_row = [
@@ -293,21 +288,64 @@ pub struct TxFieldSwitchTable {
     pub next_tx_field: Column<Fixed>,
 }
 
-static TX_FIELD_TRANSITION_TABLE: [(RlpTxFieldTag, RlpTxFieldTag); 14] = [
-    (RlpTxFieldTag::TxListRlpHeader, RlpTxFieldTag::TxRlpHeader),
-    (RlpTxFieldTag::TxRlpHeader, RlpTxFieldTag::Nonce),
-    (RlpTxFieldTag::Nonce, RlpTxFieldTag::GasPrice),
-    (RlpTxFieldTag::GasPrice, RlpTxFieldTag::Gas),
-    (RlpTxFieldTag::Gas, RlpTxFieldTag::To),
-    (RlpTxFieldTag::To, RlpTxFieldTag::Value),
-    (RlpTxFieldTag::Value, RlpTxFieldTag::Data),
-    (RlpTxFieldTag::Data, RlpTxFieldTag::Data),
-    (RlpTxFieldTag::Data, RlpTxFieldTag::SignV),
-    (RlpTxFieldTag::SignV, RlpTxFieldTag::SignR),
-    (RlpTxFieldTag::SignR, RlpTxFieldTag::SignS),
-    (RlpTxFieldTag::SignS, RlpTxFieldTag::TxRlpHeader),
-    (RlpTxFieldTag::SignS, RlpTxFieldTag::Padding),
-    (RlpTxFieldTag::Padding, RlpTxFieldTag::Padding),
+static TX_FIELD_TRANSITION_TABLE: [(RlpTxFieldTag, &[RlpTxFieldTag]); 15] = [
+    (
+        RlpTxFieldTag::TxListRlpHeader,
+        &[RlpTxFieldTag::TxRlpHeader, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::TxRlpHeader,
+        &[RlpTxFieldTag::Nonce, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::Nonce,
+        &[RlpTxFieldTag::GasPrice, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::GasPrice,
+        &[RlpTxFieldTag::Gas, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::Gas,
+        &[RlpTxFieldTag::To, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::To,
+        &[RlpTxFieldTag::Value, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::Value,
+        &[RlpTxFieldTag::Data, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::Data,
+        &[RlpTxFieldTag::Data, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::Data,
+        &[RlpTxFieldTag::SignV, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::SignV,
+        &[RlpTxFieldTag::SignR, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::SignR,
+        &[RlpTxFieldTag::SignS, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::SignS,
+        &[RlpTxFieldTag::TxRlpHeader, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::SignS,
+        &[RlpTxFieldTag::Padding, RlpTxFieldTag::DecodeError],
+    ),
+    (
+        RlpTxFieldTag::DecodeError,
+        &[RlpTxFieldTag::Padding, RlpTxFieldTag::DecodeError],
+    ),
+    (RlpTxFieldTag::Padding, &[RlpTxFieldTag::Padding]),
     // TODO: add 1559 fields
 ];
 
@@ -351,30 +389,32 @@ impl TxFieldSwitchTable {
                 let mut offset = 0;
                 tx_field_trans_table
                     .iter()
-                    .try_for_each(|(current_tx_field, next_tx_field)| {
-                        region.assign_fixed(
-                            || "table tag",
-                            self.table_tag,
-                            offset,
-                            || {
-                                Value::known(F::from(
-                                    RlpDecoderFixedTableTag::TxFieldSwitchTable as u64,
-                                ))
-                            },
-                        )?;
-                        region.assign_fixed(
-                            || "current tx field",
-                            self.current_tx_field,
-                            offset,
-                            || Value::known(F::from(*current_tx_field as u64)),
-                        )?;
-                        region.assign_fixed(
-                            || "next tx field",
-                            self.next_tx_field,
-                            offset,
-                            || Value::known(F::from(*next_tx_field as u64)),
-                        )?;
-                        offset += 1;
+                    .try_for_each(|(current_tx_field, next_tx_fields)| {
+                        for next_tx_field in next_tx_fields.iter() {
+                            region.assign_fixed(
+                                || "table tag",
+                                self.table_tag,
+                                offset,
+                                || {
+                                    Value::known(F::from(
+                                        RlpDecoderFixedTableTag::TxFieldSwitchTable as u64,
+                                    ))
+                                },
+                            )?;
+                            region.assign_fixed(
+                                || "current tx field",
+                                self.current_tx_field,
+                                offset,
+                                || Value::known(F::from(*current_tx_field as u64)),
+                            )?;
+                            region.assign_fixed(
+                                || "next tx field",
+                                self.next_tx_field,
+                                offset,
+                                || Value::known(F::from(*next_tx_field as u64)),
+                            )?;
+                            offset += 1;
+                        }
                         Ok(())
                     })
             },
