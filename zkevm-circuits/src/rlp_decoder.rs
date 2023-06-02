@@ -242,6 +242,10 @@ pub struct RlpDecoderCircuitConfigWitness<F: Field> {
     pub q_first: bool,
     /// the end
     pub q_last: bool,
+    /// r_mult_comp
+    pub r_mult_comp: F,
+    /// rlc_quotient
+    pub rlc_quotient: F,
 }
 
 /// Config for RlpDecoderCircuit
@@ -264,7 +268,7 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     /// remained rows, for n < 33 fields, it is n, for m > 33 fields, it is 33 and next row is
     /// partial, next_length = m - 33
     pub rlp_bytes_in_row: Column<Advice>,
-    /// r_mult column, (length, r_mult) => @fixed
+    /// r_mult column, (length, r_mult) => @fixed, r_mult == r ^ length
     pub r_mult: Column<Advice>,
     /// remain_length, to be 0 at the end.
     pub rlp_remain_length: Column<Advice>,
@@ -296,6 +300,10 @@ pub struct RlpDecoderCircuitConfig<F: Field> {
     pub remain_length_gt_33: LtConfig<F, 4>,
     /// condition check for prev_remain_length >= cur_length
     pub remain_length_ge_length: LtConfig<F, 4>,
+    /// divide factor for big endian rlc, r_mult_comp * r_mult = r ^ MAX_BYTE_COLUMN_NUM(33)
+    pub r_mult_comp: Column<Advice>,
+    /// quotient value for big endian rlc, rlc_quotient = rlc[0..MAX_BYTE_COLUMN_NUM] / r_mult_comp
+    pub rlc_quotient: Column<Advice>,
 }
 
 #[derive(Clone, Debug)]
@@ -345,6 +353,8 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
         let q_enable = meta.complex_selector();
         let q_first = meta.fixed_column();
         let q_last = meta.fixed_column();
+        let r_mult_comp = meta.advice_column();
+        let rlc_quotient = meta.advice_column();
 
         // type checking
         let q_rlp_types: [Column<Advice>; RlpDecodeTypeTag::RlpDecodeTypeNum as usize] = (0
@@ -493,7 +503,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             ]
         });
 
-        // lookup r_mult table with length,
+        // lookup r_mult/r_mult_comp table with length,
         // TODO: r_mult is adv, add constraint for pow
         meta.lookup_any("rlp r_mult check", |meta| {
             let r_mult = meta.query_advice(r_mult, Rotation::cur());
@@ -511,6 +521,25 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     table_tag,
                 ),
                 (q_enable.expr() * r_mult, r_mult_in_table),
+                (q_enable.expr() * pow, r_pow_in_table),
+            ]
+        });
+        meta.lookup_any("rlp r_mult_comp check", |meta| {
+            let r_mult_comp = meta.query_advice(r_mult_comp, Rotation::cur());
+            let pow = 33.expr() - meta.query_advice(tx_member_bytes_in_row, Rotation::cur());
+
+            let table = &aux_tables.rlp_fixed_table.r_mult_pow_table;
+            let table_tag = meta.query_fixed(table.table_tag, Rotation::cur());
+            let r_mult_in_table = meta.query_fixed(table.r_mult, Rotation::cur());
+            let r_pow_in_table = meta.query_fixed(table.length, Rotation::cur());
+
+            let q_enable = meta.query_selector(q_enable);
+            vec![
+                (
+                    q_enable.expr() * RlpDecoderFixedTableTag::RMult.expr(),
+                    table_tag,
+                ),
+                (q_enable.expr() * r_mult_comp, r_mult_in_table),
                 (q_enable.expr() * pow, r_pow_in_table),
             ]
         });
@@ -575,6 +604,26 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 1.expr(),
             );
 
+            let r_mult = meta.query_advice(r_mult, Rotation::cur());
+            let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
+            let rev_byte_cells = bytes
+                .iter()
+                .rev()
+                .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
+                .collect::<Vec<_>>();
+            let rlc_quotient = meta.query_advice(rlc_quotient, Rotation::cur());
+            let r_mult_comp = meta.query_advice(r_mult_comp, Rotation::cur());
+            cb.require_equal(
+                "rlc_quotient = rlc[0..32]/r_mult_comp",
+                rlc_quotient.expr() * r_mult_comp.expr(),
+                rlc::expr(&rev_byte_cells, aux_tables.challenges.keccak_input()),
+            );
+            cb.require_equal(
+                "rlc = prev_rlc * r_mult + rlc[0..32]/r_mult_comp",
+                acc_rlc_cur,
+                r_mult * meta.query_advice(acc_rlc_value, Rotation::prev()) + rlc_quotient.expr(),
+            );
+
             let valid_cur = meta.query_advice(valid, Rotation::cur());
             let valid_next = meta.query_advice(valid, Rotation::next());
             cb.require_equal(
@@ -613,10 +662,8 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let tag = meta.query_advice(tx_member, Rotation::cur());
             let complete_cur = meta.query_advice(complete, Rotation::cur());
             let rlp_tag_length_cur = meta.query_advice(rlp_tx_member_length, Rotation::cur());
-            let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let bytes_in_row_cur = meta.query_advice(tx_member_bytes_in_row, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
@@ -785,13 +832,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 );
             });
 
-            cb.require_equal(
-                "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
-                acc_rlc_cur,
-                r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
-                    + rlc::expr(&byte_cells_cur, aux_tables.challenges.keccak_input()),
-            );
-
             cb.gate(and::expr([
                 q_enable,
                 not::expr(q_first),
@@ -808,9 +848,7 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
             let complete = meta.query_advice(complete, Rotation::cur());
             let rlp_tag_length_cur = meta.query_advice(rlp_tx_member_length, Rotation::cur());
-            let r_mult = meta.query_advice(r_mult, Rotation::cur());
             let remain_length = meta.query_advice(rlp_remain_length, Rotation::cur());
-            let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
@@ -869,13 +907,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                 );
             });
 
-            cb.require_equal(
-                "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
-                acc_rlc_cur,
-                r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
-                    + rlc::expr(&byte_cells_cur, aux_tables.challenges.keccak_input()),
-            );
-
             cb.gate(q_first)
         });
 
@@ -888,8 +919,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             let tx_member_cur = meta.query_advice(tx_member, Rotation::cur());
             let complete = meta.query_advice(complete, Rotation::cur());
             let rlp_tag_length_cur = meta.query_advice(rlp_tx_member_length, Rotation::cur());
-            let r_mult = meta.query_advice(r_mult, Rotation::cur());
-            let acc_rlc_cur = meta.query_advice(acc_rlc_value, Rotation::cur());
             let byte_cells_cur = bytes
                 .iter()
                 .map(|byte_col| meta.query_advice(*byte_col, Rotation::cur()))
@@ -925,13 +954,6 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
                     byte_cells_cur[0].expr() - 247.expr() + 1.expr(),
                 );
             });
-
-            cb.require_equal(
-                "rlc = r_mult_cur * rlc_next + rlc(bytes_cur)",
-                acc_rlc_cur,
-                r_mult * meta.query_advice(acc_rlc_value, Rotation::next())
-                    + rlc::expr(&byte_cells_cur, aux_tables.challenges.keccak_input()),
-            );
 
             cb.gate(q_tx_rlp_header * meta.query_selector(q_enable))
         });
@@ -1062,6 +1084,8 @@ impl<F: Field> SubCircuitConfig<F> for RlpDecoderCircuitConfig<F> {
             v_gt_0: cmp_0_lt_byte1,
             remain_length_gt_33: cmp_33_lt_prev_remain,
             remain_length_ge_length: cmp_length_le_prev_remain,
+            r_mult_comp,
+            rlc_quotient,
         };
         circuit_config
     }
@@ -1464,7 +1488,7 @@ fn generate_rlp_type_witness(
             if header_byte == 0x81 {
                 value_decodable = bytes[1] >= 0x80;
             } else {
-                value_decodable = bytes[1] >= 0;
+                value_decodable = bytes[1] > 0;
             }
             match tx_member {
                 RlpTxFieldTag::To => RlpDecodeTypeTag::ShortStringBytes,
@@ -1477,11 +1501,11 @@ fn generate_rlp_type_witness(
             RlpDecodeTypeTag::LongString1
         }
         0xb9 => {
-            len_decodable = bytes[1] >= 0;
+            len_decodable = bytes[1] > 0;
             RlpDecodeTypeTag::LongString2
         }
         0xba => {
-            len_decodable = bytes[1] >= 0;
+            len_decodable = bytes[1] > 0;
             RlpDecodeTypeTag::LongString3
         }
         0xc0 => RlpDecodeTypeTag::EmptyList,
@@ -1544,6 +1568,8 @@ fn generate_rlp_row_witness<F: Field>(
                     q_enable: true,
                     q_first: false,
                     q_last: false,
+                    r_mult_comp: F::one(),
+                    rlc_quotient: F::zero(),
                 });
                 raw_bytes_offset += MAX_BYTE_COLUMN_NUM;
                 tag_remain_length -= MAX_BYTE_COLUMN_NUM;
@@ -1568,6 +1594,8 @@ fn generate_rlp_row_witness<F: Field>(
                 q_enable: true,
                 q_first: false,
                 q_last: false,
+                r_mult_comp: r.pow(&[(MAX_BYTE_COLUMN_NUM - tag_remain_length) as u64, 0, 0, 0]),
+                rlc_quotient: F::zero(),
             });
             temp_witness_vec
         }};
@@ -1831,16 +1859,6 @@ fn rlp_decode_tx_list_manually<F: Field>(
         k as usize - witness_len - 2 - NUM_BLINDING_ROWS,
     );
 
-    // make sure we have comsumed all bytes
-    assert!(complete_witness[0].rlp_remain_length == bytes.len());
-    debug_assert_eq!(
-        complete_witness[0].acc_rlc_value,
-        bytes
-            .iter()
-            .rev()
-            .fold(F::zero(), |acc, b| acc * r + F::from(*b as u64))
-    );
-
     // update the rlp bytes hash
     let mut hasher = Keccak::default();
     hasher.update(bytes);
@@ -1853,19 +1871,32 @@ fn rlp_decode_tx_list_manually<F: Field>(
     for iw in complete_witness.iter().enumerate() {
         log::trace!("witness[{}] {:?}", iw.0, iw.1);
     }
+
+    // make sure we have comsumed all bytes
+    assert!(complete_witness[0].rlp_remain_length == bytes.len());
+    debug_assert_eq!(
+        complete_witness[complete_witness.len() - 2].acc_rlc_value,
+        bytes
+            .iter()
+            .fold(F::zero(), |acc, b| acc * r + F::from(*b as u64))
+    );
+
     complete_witness
 }
 
 fn fixup_acc_rlc<F: Field>(witness: &mut Vec<RlpDecoderCircuitConfigWitness<F>>, randomness: F) {
-    let mut rev_iter = witness.iter_mut().rev();
+    let mut wit_iter = witness.iter_mut();
     let mut prev: Option<&mut RlpDecoderCircuitConfigWitness<F>> = None;
-    while let Some(current_witness) = rev_iter.next() {
-        let prev_acc_rlc_value =
-            prev.map_or(F::zero(), |w| w.acc_rlc_value * current_witness.r_mult);
-        current_witness.acc_rlc_value =
-            prev_acc_rlc_value + rlc::value(&current_witness.bytes, randomness);
+    while let Some(cur_wit) = wit_iter.next() {
+        let prev_acc_rlc = prev.map_or(F::zero(), |w| w.acc_rlc_value);
+        let mut bytes = cur_wit.bytes.clone();
+        bytes.resize(MAX_BYTE_COLUMN_NUM, 0);
+        bytes.reverse();
+        cur_wit.rlc_quotient =
+            rlc::value(&bytes, randomness) * cur_wit.r_mult_comp.invert().unwrap();
+        cur_wit.acc_rlc_value = prev_acc_rlc * cur_wit.r_mult + cur_wit.rlc_quotient;
 
-        prev = Some(current_witness);
+        prev = Some(cur_wit);
     }
 }
 fn complete_paddings<F: Field>(
@@ -1876,12 +1907,12 @@ fn complete_paddings<F: Field>(
     let mut pre_padding = RlpDecoderCircuitConfigWitness::<F>::default();
     pre_padding.rlp_remain_length =
         witness[0].rlp_remain_length + witness[0].rlp_bytes_in_row as usize;
-    pre_padding.acc_rlc_value = witness[0].acc_rlc_value;
 
     complete_witness.push(pre_padding);
     witness[0].q_first = true;
     complete_witness.append(witness);
 
+    let before_padding = complete_witness.last().unwrap().clone();
     for i in 0..num_padding_to_last_row {
         complete_witness.push(RlpDecoderCircuitConfigWitness::<F> {
             tx_id: 0,
@@ -1894,13 +1925,15 @@ fn complete_paddings<F: Field>(
             r_mult: F::one(),
             rlp_remain_length: 0,
             value: F::zero(),
-            acc_rlc_value: F::zero(),
+            acc_rlc_value: before_padding.acc_rlc_value,
             bytes: [0; MAX_BYTE_COLUMN_NUM].to_vec(),
             errors: [false, false, false, false],
             valid: true,
             q_enable: true,
             q_first: false,
             q_last: i == num_padding_to_last_row - 1,
+            r_mult_comp: F::one(),
+            rlc_quotient: F::zero(),
         });
     }
     complete_witness.push(RlpDecoderCircuitConfigWitness::<F>::default());
