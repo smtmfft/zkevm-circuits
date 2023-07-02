@@ -106,7 +106,7 @@ impl RlpDecodeRule {
 }
 
 /// rules of tx members
-pub const RLP_TX_FIELD_DECODE_RULES: [(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRule); 13] = [
+pub const RLP_TX_FIELD_DECODE_RULES: [(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRule); 14] = [
     (
         RlpTxTypeTag::TxLegacyType,
         RlpTxFieldTag::TxListRlpHeader,
@@ -170,6 +170,11 @@ pub const RLP_TX_FIELD_DECODE_RULES: [(RlpTxTypeTag, RlpTxFieldTag, RlpDecodeRul
     (
         RlpTxTypeTag::TxLegacyType,
         RlpTxFieldTag::Padding,
+        RlpDecodeRule::Padding,
+    ),
+    (
+        RlpTxTypeTag::TxLegacyType,
+        RlpTxFieldTag::DecodeError,
         RlpDecodeRule::Padding,
     ),
 ];
