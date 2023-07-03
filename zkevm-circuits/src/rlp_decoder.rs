@@ -208,7 +208,7 @@ impl_expr!(RlpTxTypeTag);
 pub const MAX_BYTE_COLUMN_NUM: usize = 33;
 
 /// Witness for RlpDecoderCircuit
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RlpDecoderCircuitConfigWitness<F: Field> {
     /// tx_id column
     pub tx_id: u64,
@@ -1497,7 +1497,10 @@ fn generate_rlp_type_witness(
                 value_decodable = bytes[1] > 0;
             }
             match tx_member {
-                RlpTxFieldTag::To => RlpDecodeTypeTag::ShortStringBytes,
+                RlpTxFieldTag::To => {
+                    value_decodable = true;
+                    RlpDecodeTypeTag::ShortStringBytes
+                }
                 RlpTxFieldTag::Data => RlpDecodeTypeTag::ShortStringBytes,
                 _ => RlpDecodeTypeTag::ShortStringValue,
             }
@@ -1750,9 +1753,9 @@ impl<F: Field> RlpTxFieldStateWittnessGenerator<F> for RlpTxFieldTag {
             }
             RlpTxFieldTag::Padding => {
                 let witness_len = witness.len();
-                assert!(k > (witness_len + 2 + NUM_BLINDING_ROWS));
+                assert!(k > (witness_len + 1 + NUM_BLINDING_ROWS));
                 fixup_acc_rlc_new(witness, r);
-                complete_paddings_new(witness, k as usize - witness_len - 2 - NUM_BLINDING_ROWS);
+                complete_paddings_new(witness, k as usize - witness_len - 1 - NUM_BLINDING_ROWS);
                 (RlpTxFieldTag::Padding, None)
             }
             RlpTxFieldTag::ChainID => todo!(),
@@ -2214,36 +2217,30 @@ fn gen_rlp_decode_state_witness<F: Field>(
 ) -> Vec<RlpDecoderCircuitConfigWitness<F>> {
     let mut tx_id: u64 = 0;
 
+    // update the rlp bytes hash
+    let mut hasher = Keccak::default();
+    hasher.update(bytes);
+    let hash = hasher.digest();
+
     let mut witness = vec![RlpDecoderCircuitConfigWitness::<F> {
-        tx_id: tx_id,
-        tx_type: RlpTxTypeTag::TxLegacyType,
-        tx_member: RlpTxFieldTag::TxListRlpHeader,
-        complete: false,
-        rlp_type: RlpDecodeTypeTag::DoNothing,
-        rlp_tx_member_length: 0u64,
-        rlp_bytes_in_row: MAX_BYTE_COLUMN_NUM as u8,
-        r_mult: F::zero(),
         rlp_remain_length: bytes.len(),
-        value: F::zero(),
-        acc_rlc_value: F::zero(),
-        bytes: [0; MAX_BYTE_COLUMN_NUM].to_vec(),
-        errors: [false; 4],
-        valid: false,
-        q_enable: false,
-        q_first: false,
-        q_last: false,
-        r_mult_comp: F::one(),
-        rlc_quotient: F::zero(),
+        value: hash
+            .iter()
+            .rev()
+            .fold(F::zero(), |acc, b| acc * r + F::from(*b as u64)),
+        ..Default::default()
     }];
 
     let mut offset = 0;
     let mut init_state = RlpTxFieldTag::TxListRlpHeader;
 
     loop {
-        tx_id = 1;
-        println!("Current state: {:?}, offset = {:?}", init_state, offset);
+        // println!("Current state: {:?}, offset = {:?}", init_state, offset);
         let (next_state, next_offset) =
             init_state.next(k, tx_id, &bytes[offset..], r, &mut witness);
+        if next_state == RlpTxFieldTag::TxRlpHeader {
+            tx_id += 1;
+        }
         match next_offset {
             Some(n) => {
                 offset += n;
@@ -2613,7 +2610,7 @@ fn generate_rlp_row_witness_new<F: Field>(
                 errors: errors,
                 valid: errors.iter().all(|&err| !err),
                 q_enable: true,
-                q_first: false,
+                q_first: tx_member == &RlpTxFieldTag::TxListRlpHeader,
                 q_last: false,
                 r_mult_comp: r.pow(&[(MAX_BYTE_COLUMN_NUM - tag_remain_length) as u64, 0, 0, 0]),
                 rlc_quotient: F::zero(),
@@ -2840,8 +2837,18 @@ mod rlp_test {
         let k = 256;
 
         let witness = rlp_decode_tx_list_manually::<Fr>(&rlp_bytes, randomness, k);
-        for (i, w) in witness.iter().enumerate() {
-            print!("witness[{}] = {:?}\n", i, w);
+        // for (i, w) in witness.iter().enumerate() {
+        //     print!("witness[{}] = {:?}\n", i, w);
+        // }
+
+        let witness1: Vec<super::RlpDecoderCircuitConfigWitness<Fr>> =
+            gen_rlp_decode_state_witness::<Fr>(&rlp_bytes, randomness, k as usize);
+
+        let mut i = 0;
+        for (w, w1) in witness.iter().zip(witness1.iter()) {
+            println!("{}th row", i);
+            assert_eq!(w, w1);
+            i += 1;
         }
     }
 
