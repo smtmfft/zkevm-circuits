@@ -2926,6 +2926,32 @@ mod rlp_decode_circuit_tests {
         use super::*;
         use pretty_assertions::assert_eq;
 
+        /// predefined tx bytes
+        /// "f8 50"        // witness[1]: list header
+        /// "f8 4e"        // witness[2]: tx header
+        /// "80"           // witness[3]: nonce
+        /// "01"           // witness[4]: gas_price
+        /// "83 0f4240"    // witness[5]: gas
+        /// "80"           // witness[6]: to
+        /// "80"           // witness[7]: value
+        /// "82 3031"      // witness[8]: input
+        /// "82 0a98"      // witness[9]: v
+        /// "a0 b05805737618f6ac1ef211c02575f2fa82026fa1742caf192e2cffcd4161adca"  // witness[10]: r
+        /// "a0 53fbe3d9957dffafca84c419fdd1cead150834c5de9f3215c66327123c0a0541"  // witness[11]: s
+        fn const_tx_hex() -> String {
+            String::from("f852")
+                + "f850"
+                + "80"
+                + "01"
+                + "830f4240"
+                + "80"
+                + "80"
+                + "823031"
+                + "820a98"
+                + "a0b05805737618f6ac1ef211c02575f2fa82026fa1742caf192e2cffcd4161adca"
+                + "a053fbe3d9957dffafca84c419fdd1cead150834c5de9f3215c66327123c0a0541"
+        }
+
         fn generate_rlp_bytes(txs: Vec<Transaction>) -> Vec<u8> {
             let k = log2_ceil(RlpDecoderCircuit::<Fr>::min_num_rows_from_tx(&txs).0);
 
@@ -2953,82 +2979,122 @@ mod rlp_decode_circuit_tests {
         }
 
         #[test]
+        fn const_tx_decode_is_ok() {
+            let k = 12;
+            let rlp_bytes = hex::decode(const_tx_hex()).unwrap();
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            // println!("witness = {:?}", &witness);
+            assert_eq!(witness[witness.len() - 2].valid, true);
+            assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
+        }
+
+        #[test]
         fn invalid_rlp_wrong_list_header_header() {
-            let mut rng = ChaCha20Rng::seed_from_u64(2u64);
-            let tx: Transaction = mock::MockTransaction::default()
-                .from(AddrOrWallet::random(&mut rng))
-                .input(eth_types::Bytes::from(b"0"))
-                .build()
-                .into();
-            let mut rlp_bytes = generate_rlp_bytes(vec![tx.clone()]);
+            let mut rlp_bytes = hex::decode(const_tx_hex()).unwrap();
             rlp_bytes[0] = 0xc0;
 
-            let k = log2_ceil(RlpDecoderCircuit::<Fr>::min_num_rows_from_tx(&vec![tx.clone()]).0)
-                as usize;
+            let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[1].valid, false);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
             assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
         fn invalid_rlp_wrong_list_header_len() {
-            let mut rng = ChaCha20Rng::seed_from_u64(2u64);
-            let tx: Transaction = mock::MockTransaction::default()
-                .from(AddrOrWallet::random(&mut rng))
-                .input(eth_types::Bytes::from(b"0"))
-                .build()
-                .into();
-            let mut rlp_bytes = generate_rlp_bytes(vec![tx.clone()]);
+            let mut rlp_bytes = hex::decode(const_tx_hex()).unwrap();
             rlp_bytes[1] = 0x00;
 
-            let k = log2_ceil(RlpDecoderCircuit::<Fr>::min_num_rows_from_tx(&vec![tx.clone()]).0)
-                as usize;
+            let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[1].valid, false);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
             assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
         fn invalid_rlp_wrong_tx_header_header() {
-            let mut rlp_bytes = hex::decode(
-                "f850\
-                f84e\
-                80\
-                01\
-                830f4240\
-                80\
-                80\
-                30\
-                820a98\
-                a0b05805737618f6ac1ef211c02575f2fa82026fa1742caf192e2cffcd4161adca\
-                a053fbe3d9957dffafca84c419fdd1cead150834c5de9f3215c66327123c0a0541",
-            )
-            .unwrap();
-            rlp_bytes[3] = 0xf5;
+            let mut rlp_bytes = hex::decode(&const_tx_hex()).unwrap();
+            rlp_bytes[2] = 0xf5;
 
             let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[1].valid, true);
+            assert_eq!(witness[2].valid, false);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
             assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
         fn invalid_rlp_wrong_tx_header_len() {
-            todo!()
+            let mut rlp_bytes = hex::decode(&const_tx_hex()).unwrap();
+            rlp_bytes[3] = 0x00;
+
+            let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
+            assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
         fn invalid_rlp_wrong_tx_field_nonce() {
-            todo!()
+            let mut rlp_bytes = hex::decode(&const_tx_hex()).unwrap();
+            rlp_bytes[4] = 0x00;
+
+            let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[2].valid, true);
+            assert_eq!(witness[3].valid, false);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
+            assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
         fn invalid_rlp_wrong_tx_field_gas() {
-            todo!()
+            let mut rlp_bytes = hex::decode(&const_tx_hex()).unwrap();
+            rlp_bytes[5] = 0x00;
+
+            let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[3].valid, true);
+            assert_eq!(witness[4].valid, false);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
+            assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
         fn invalid_rlp_wrong_tx_field_to() {
-            todo!()
+            let mut rlp_bytes = hex::decode(&const_tx_hex()).unwrap();
+            rlp_bytes[10] = 0x00;
+
+            let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[5].valid, true);
+            assert_eq!(witness[6].valid, false);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
+            assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
         fn invalid_rlp_wrong_tx_field_data() {
-            todo!()
+            let mut rlp_bytes = hex::decode(&const_tx_hex()).unwrap();
+            rlp_bytes[12] = 0x81;
+            rlp_bytes[13] = 0x02;
+
+            let k = 12;
+            let witness = gen_rlp_decode_state_witness(&rlp_bytes, Fr::one(), 1 << k);
+            assert_eq!(witness[7].valid, true);
+            assert_eq!(witness[8].valid, false);
+            assert_eq!(witness[witness.len() - 2].valid, false);
+
+            assert_eq!(run_invalid_rlp::<Fr>(rlp_bytes, k), Ok(()));
         }
 
         #[test]
