@@ -8,3 +8,4 @@ pub mod mpt;
 pub mod param;
 pub mod storage_leaf;
 pub mod witness_row;
+extern crate gadgets;

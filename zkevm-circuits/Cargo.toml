@@ -37,6 +37,7 @@ subtle = "2.4"
 rand_chacha = "0.3"
 snark-verifier = { git = "https://github.com/privacy-scaling-explorations/snark-verifier", tag = "v2023_02_02", default-features = false, features = ["loader_halo2", "system_halo2"] }
 num_enum = "0.5.7"
+ark-std = { version = "0.3", features = ["print-trace"] }
 
 [dev-dependencies]
 bus-mapping = { path = "../bus-mapping", features = ["test"] }
@@ -51,7 +52,7 @@ serde = { version = "1.0.130", features = ["derive"] }
 serde_json = "1.0.78"
 
 [features]
-default = []
+default = ["test"]
 test = ["ethers-signers", "mock"]
 test-circuits = []
 warn-unimplemented = ["eth-types/warn-unimplemented"]
