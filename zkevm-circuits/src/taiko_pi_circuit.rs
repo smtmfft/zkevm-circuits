@@ -1,14 +1,20 @@
 //! Use the hash value as public input.
 
 use crate::{
-    evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
+    evm_circuit::table::Table::*,
+    evm_circuit::{util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon}, table::Table},
     table::{byte_table::ByteTable, BlockContextFieldTag, BlockTable, KeccakTable, LookupTable},
     util::{random_linear_combine_word as rlc, Challenges, SubCircuit, SubCircuitConfig},
-    witness::{self, BlockContext},
+    circuit_tools::{
+        constraint_builder::{ConstraintBuilder, TO_FIX},
+        cell_manager::{CellManager, CellType},
+    },
+    
+    witness::{self, BlockContext}, circuit,
 };
 use eth_types::{Address, Field, ToBigEndian, ToWord, Word, H256};
 use ethers_core::utils::keccak256;
-use gadgets::util::{or, select, Expr};
+use gadgets::util::{or, select, Expr, and};
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
@@ -196,6 +202,30 @@ pub struct TaikoPiCircuitConfigArgs<F: Field> {
     pub challenges: Challenges<Expression<F>>,
 }
 
+/// 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PiCellType {
+    ///
+    Storage,
+    ///
+    Lookup(Table)
+}
+impl CellType for PiCellType {
+    fn byte_type() -> Option<Self> {
+        unimplemented!()
+    }
+    fn storage_for_phase(phase: u8) -> Self {
+        unimplemented!()
+    }
+}
+impl Default for PiCellType {
+    fn default() -> Self {
+        Self::Storage
+    }
+}
+
+
+
 impl<F: Field> SubCircuitConfig<F> for TaikoPiCircuitConfig<F> {
     type ConfigArgs = TaikoPiCircuitConfigArgs<F>;
 
@@ -229,82 +259,98 @@ impl<F: Field> SubCircuitConfig<F> for TaikoPiCircuitConfig<F> {
         meta.enable_equality(block_table.value);
         meta.enable_equality(pi);
 
+        let cm = CellManager::new(
+            meta,
+            vec![
+                (PiCellType::Storage, 3, 1, false),
+            ],
+            0,
+            1,
+        );
+        let mut cb: ConstraintBuilder<F, PiCellType> =  ConstraintBuilder::new(4,  Some(cm), Some(challenges.evm_word()));
+        cb.preload_tables(meta,
+            &[
+               (PiCellType::Lookup(Keccak), &keccak_table), 
+               (PiCellType::Lookup(Bytecode), &byte_table), 
+               (PiCellType::Lookup(Block), &block_table)
+               ]
+           );
+
         // field bytes
         meta.create_gate(
-            "rpi_field_bytes_acc[i+1] = rpi_field_bytes_acc[i] * t + rpi_bytes[i+1]",
+            "PI acc constraints", 
             |meta| {
-                let mut cb = BaseConstraintBuilder::new(MAX_DEGREE);
+            circuit!([meta, cb], {
+                // rpi_field_bytes_acc[i+1] = rpi_field_bytes_acc[i] * t + rpi_bytes[i+1]
+                ifx!(q!(q_field_step) => {
+                    let t = ifx!(f!(is_field_rlc) => {
+                        challenges.evm_word()
+                    } elsex {
+                        BYTE_POW_BASE.expr()
+                    });
+                    require!(
+                        a!(rpi_field_bytes_acc, 1) => a!(rpi_field_bytes_acc) * t + a!(rpi_field_bytes, 1)
+                    );
+                });
+                // rpi_field_bytes_acc[0] = rpi_field_bytes[0]
+                ifx!(q!(q_field_start) => {
+                    require!(a!(rpi_field_bytes_acc) => a!(rpi_field_bytes));
+                });
+            });
+            cb.build_constraints(None)
+        });
 
-                let q_field_step = meta.query_selector(q_field_step);
-                let rpi_field_bytes_acc_next =
-                    meta.query_advice(rpi_field_bytes_acc, Rotation::next());
-                let rpi_field_bytes_acc = meta.query_advice(rpi_field_bytes_acc, Rotation::cur());
-                let rpi_field_bytes_next = meta.query_advice(rpi_field_bytes, Rotation::next());
-                let is_field_rlc = meta.query_fixed(is_field_rlc, Rotation::next());
-                let randomness = challenges.evm_word();
-                let t = select::expr(is_field_rlc, randomness, BYTE_POW_BASE.expr());
-                cb.require_equal(
-                    "rpi_field_bytes_acc[i+1] = rpi_field_bytes_acc[i] * t + rpi_bytes[i+1]",
-                    rpi_field_bytes_acc_next,
-                    rpi_field_bytes_acc * t + rpi_field_bytes_next,
-                );
-                cb.gate(q_field_step)
-            },
+        meta.create_gate("keccak(rpi)", |meta| {
+            cb.restart();
+            circuit!([meta, cb], {
+                ifx!(q!(q_keccak) => {
+                    // 
+                    require!(
+                        (1.expr(), a!(rpi_field_bytes_acc), RPI_BYTES_LEN.expr(), a!(rpi_rlc_acc))
+                        => @PiCellType::Lookup(Table::Keccak), (TO_FIX)
+                    );
+                });
+            });
+            cb.build_constraints(None)
+        });
+
+        meta.create_gate("in block table", |meta| {
+            circuit!([meta, cb], {
+                ifx!(q!(q_block_table) => {
+                    // (BlockHashTag, block#, f0*c^0+f1*c^1+...), field rlc with challenge
+                    require!(
+                        (
+                            BlockContextFieldTag::BlockHash.expr(), 
+                            a!(block_index), 
+                            a!(rpi_field_bytes_acc) // 此时等于 block hash
+                        ) => @PiCellType::Lookup(Table::Block), (TO_FIX)
+                    );
+                });
+            });
+            cb.build_constraints(None)
+        });
+
+        meta.create_gate("is_byte", |meta| {
+            circuit!([meta, cb], {
+                ifx!(or::expr([q!(q_field_start), q!(q_field_end)]) => {
+                    require!(
+                        (a!(rpi_field_bytes)) => @PiCellType::Lookup(Table::Bytecode), (TO_FIX)
+                    );
+                });
+            });
+            cb.build_constraints(None)
+        });
+
+        cb.build_lookups(
+            meta,
+            &[cb.cell_manager.clone().unwrap()],
+            &[
+                (PiCellType::Lookup(Table::Keccak), PiCellType::Lookup(Table::Keccak)),
+                (PiCellType::Lookup(Table::Block),PiCellType::Lookup(Table::Block)),
+                (PiCellType::Lookup(Table::Bytecode), PiCellType::Lookup(Table::Bytecode)),
+            ],
+            None
         );
-        meta.create_gate("rpi_field_bytes_acc[0] = rpi_field_bytes[0]", |meta| {
-            let mut cb = BaseConstraintBuilder::new(MAX_DEGREE);
-
-            let q_field_start = meta.query_selector(q_field_start);
-            let rpi_field_bytes_acc = meta.query_advice(rpi_field_bytes_acc, Rotation::cur());
-            let rpi_field_bytes = meta.query_advice(rpi_field_bytes, Rotation::cur());
-
-            cb.require_equal(
-                "rpi_field_bytes_acc[0] = rpi_field_bytes[0]",
-                rpi_field_bytes_acc,
-                rpi_field_bytes,
-            );
-            cb.gate(q_field_start)
-        });
-
-        // keccak in rpi
-        meta.lookup_any("keccak(rpi)", |meta| {
-            let q_keccak = meta.query_selector(q_keccak);
-            let rpi_rlc = meta.query_advice(rpi_field_bytes_acc, Rotation::cur());
-            let output = meta.query_advice(rpi_rlc_acc, Rotation::cur());
-            [1.expr(), rpi_rlc, RPI_BYTES_LEN.expr(), output]
-                .into_iter()
-                .zip(keccak_table.table_exprs(meta).into_iter())
-                .map(|(arg, table)| (q_keccak.expr() * arg, table))
-                .collect::<Vec<_>>()
-        });
-
-        // in block table
-        meta.lookup_any("in block table", |meta| {
-            let q_block_table = meta.query_selector(q_block_table);
-            let block_index = meta.query_advice(block_index, Rotation::cur());
-            let block_hash = meta.query_advice(rpi_field_bytes_acc, Rotation::cur());
-            [
-                BlockContextFieldTag::BlockHash.expr(),
-                block_index,
-                block_hash,
-            ]
-            .into_iter()
-            .zip(block_table.table_exprs(meta).into_iter())
-            .map(|(arg, table)| (q_block_table.expr() * arg, table))
-            .collect::<Vec<_>>()
-        });
-        // is byte
-        meta.lookup_any("is_byte", |meta| {
-            let q_field_step = meta.query_selector(q_field_start);
-            let q_field_end = meta.query_selector(q_field_end);
-            let is_field = or::expr([q_field_step, q_field_end]);
-            let rpi_field_bytes = meta.query_advice(rpi_field_bytes, Rotation::cur());
-            [rpi_field_bytes]
-                .into_iter()
-                .zip(byte_table.table_exprs(meta).into_iter())
-                .map(|(arg, table)| (is_field.expr() * arg, table))
-                .collect::<Vec<_>>()
-        });
 
         Self {
             rpi_field_bytes,
@@ -331,6 +377,7 @@ impl<F: Field> SubCircuitConfig<F> for TaikoPiCircuitConfig<F> {
     }
 }
 
+// input -> kecceck, output -> evm
 impl<F: Field> TaikoPiCircuitConfig<F> {
     #[allow(clippy::too_many_arguments)]
     fn assign_pi_field(
@@ -339,24 +386,30 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
         offset: &mut usize,
         _annotation: &'static str,
         field_bytes: &[u8],
-        rpi_rlc_acc: &mut Value<F>,
+        rpi_rlc_acc: &mut Value<F>,             // 总的
         challenges: &Challenges<Value<F>>,
         keccak_hi_lo: bool,
         block_number: Option<Word>,
     ) -> Result<Vec<AssignedCell<F, F>>, Error> {
         let len = field_bytes.len();
-        let mut field_rlc_acc = Value::known(F::ZERO);
-        let (use_rlc, t) = if len * 8 > F::CAPACITY as usize {
-            (F::ONE, challenges.evm_word())
+        let mut field_rlc_acc = Value::known(F::ZERO); // field 的
+        let (use_rlc, t, t_) = if len * 8 > F::CAPACITY as usize {
+            // 正常字段
+            (F::ONE, challenges.evm_word(), "evm_work")
         } else {
-            (F::ZERO, Value::known(F::from(BYTE_POW_BASE)))
+            println!("use_rlc {:?}, t={:?}", len, BYTE_POW_BASE);
+            // lo hi 
+            (F::ZERO, Value::known(F::from(BYTE_POW_BASE)), "BYTE_POW_BASE")
         };
 
-        let randomness = if keccak_hi_lo {
-            challenges.evm_word()
+        let (randomness, r_) = if keccak_hi_lo {
+            // input
+            (challenges.evm_word(), "evm_word")
         } else {
-            challenges.keccak_input()
+            // keccak input 
+            (challenges.keccak_input(), "keccak_input")
         };
+        println!("  t={:?}, r={:?}", t_, r_);
         let mut cells = vec![None; field_bytes.len() + 2];
         for (i, byte) in field_bytes.iter().enumerate() {
             let row_offset = *offset + i;
@@ -368,7 +421,7 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                 || Value::known(use_rlc),
             )?;
 
-            // assign field bytes
+            // 直接写 Byte
             let field_byte_cell = region.assign_advice(
                 || "field bytes",
                 self.rpi_field_bytes,
@@ -376,6 +429,7 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                 || Value::known(F::from(*byte as u64)),
             )?;
 
+            // 字段
             field_rlc_acc = field_rlc_acc * t + Value::known(F::from(*byte as u64));
             let rpi_cell = region.assign_advice(
                 || "field bytes acc",
@@ -383,6 +437,10 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                 row_offset,
                 || field_rlc_acc,
             )?;
+
+            // 总体
+            // 到了 keccak hi & low 那俩行，用 evm_word
+            // 否则用 keccak_input
             *rpi_rlc_acc = *rpi_rlc_acc * randomness + Value::known(F::from(*byte as u64));
             let rpi_rlc_acc_cell = region.assign_advice(
                 || "rpi_rlc_acc",
@@ -390,6 +448,8 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                 row_offset,
                 || *rpi_rlc_acc,
             )?;
+
+
             // setup selector
             if i == 0 {
                 self.q_field_start.enable(region, row_offset)?;
@@ -400,6 +460,7 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                 cells[RPI_CELL_IDX] = Some(rpi_cell);
                 cells[RPI_RLC_ACC_CELL_IDX] = Some(rpi_rlc_acc_cell);
                 if let Some(block_number) = block_number {
+                    println!("---self.q_block_table.enable--- {:?} {:?}", block_number, field_bytes);
                     self.q_block_table.enable(region, row_offset)?;
                     region.assign_advice(
                         || "block_index",
@@ -429,7 +490,9 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                 let mut rpi_rlc_acc = Value::known(F::ZERO);
                 let mut offset = 0;
                 let mut rpi_rlc_acc_cell = None;
+                println!("\n===================");
                 for (annotation, block_number, field_bytes) in public_data.assignments() {
+                    println!("{:?}, len {:?}， offset {:?}", annotation, field_bytes.len(), offset);
                     let cells = self.assign_pi_field(
                         region,
                         &mut offset,
@@ -455,22 +518,31 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                     keccak_row,
                 )?;
                 let keccak = public_data.get_pi();
-                let mut keccak_input = keccak.to_fixed_bytes();
-                keccak_input.reverse();
-                let keccak_rlc = challenges
+                let mut keccak_output = keccak.to_fixed_bytes();
+                keccak_output.reverse();
+                let keccak_output_rlc = challenges
                     .evm_word()
-                    .map(|randomness| rlc(keccak_input, randomness));
+                    .map(|randomness| rlc(keccak_output, randomness));
                 let keccak_output_cell = region.assign_advice(
                     || "keccak(rpi)_output",
                     self.rpi_rlc_acc,
                     keccak_row,
-                    || keccak_rlc,
+                    || keccak_output_rlc,
                 )?;
+                println!("---self.q_keccak.enable---");
                 self.q_keccak.enable(region, keccak_row)?;
+
+                // 设成零 ！！！！！
 
                 rpi_rlc_acc = Value::known(F::ZERO);
                 offset += 1;
                 let mut pi = Vec::with_capacity(2);
+
+                // kck_output = rlc(
+                //      r = evm_word(),
+                //      keccak(concat([l1_signal, l2_signal, metadata, ...]))
+                // )
+                // kck_output -> keccak_output_cell
 
                 for (idx, (annotation, field_bytes)) in [
                     (
@@ -482,6 +554,7 @@ impl<F: Field> TaikoPiCircuitConfig<F> {
                 .into_iter()
                 .enumerate()
                 {
+                    println!("high_16_bytes_of_keccak_rpi");
                     let cells = self.assign_pi_field(
                         region,
                         &mut offset,
